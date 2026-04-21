@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>SRS + BunnyCDN LL-HLS Test</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #0a0a0a;
+      color: #e0e0e0;
+      padding: 20px;
+    }
+    .container { max-width: 1280px; margin: 0 auto; }
+    h1 { font-size: 1.5em; margin-bottom: 16px; }
+    .mode-selector {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 16px;
+      background: #1a1a1a;
+      padding: 4px;
+      border-radius: 8px;
+    }
+    .mode-btn {
+      flex: 1;
+      padding: 10px;
+      background: transparent;
+      color: #888;
+      cursor: pointer;
+      border-radius: 4px;
+      border: none;
+    }
+    .mode-btn.active { background: #4CAF50; color: white; }
+    .controls {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    input[type="text"] {
+      flex: 1;
+      min-width: 200px;
+      padding: 10px 14px;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: #fff;
+      font-family: monospace;
+    }
+    button {
+      padding: 10px 20px;
+      background: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button.danger { background: #f44336; }
+    button.secondary { background: #2196F3; }
+    video { width: 100%; max-width: 1280px; background: #000; border-radius: 8px; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .card {
+      background: #1a1a1a;
+      border: 1px solid #2a2a2a;
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .label { font-size: 11px; color: #888; text-transform: uppercase; margin-bottom: 6px; }
+    .value { font-size: 1.4em; font-weight: 600; font-family: monospace; color: #4CAF50; }
+    .value.warn { color: #ff9800; }
+    .value.error { color: #f44336; }
+    .value.dim { color: #666; }
+    .log {
+      margin-top: 16px;
+      background: #1a1a1a;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 11px;
+      max-height: 200px;
+      overflow-y: auto;
+      border-radius: 8px;
+      line-height: 1.5;
+    }
+    .log-ok { color: #4CAF50; }
+    .log-warn { color: #ff9800; }
+    .log-err { color: #f44336; }
+    .log-info { color: #888; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🐰 SRS + BunnyCDN LL-HLS Test</h1>
+    
+    <div class="mode-selector">
+      <button class="mode-btn active" onclick="setMode('lowlat', event)">Low Latency (2-4s)</button>
+      <button class="mode-btn" onclick="setMode('balanced', event)">Balanced (5-8s)</button>
+      <button class="mode-btn" onclick="setMode('stable', event)">Stable (10-15s)</button>
+    </div>
+    
+    <div class="controls">
+      <input type="text" id="signUrl" value="http://45.76.145.205/sign" placeholder="Sign endpoint">
+      <input type="text" id="streamName" value="studio1" placeholder="Stream" style="flex: 0 0 150px; min-width: 150px;">
+      <button onclick="loadStream()">▶ Load</button>
+      <button class="secondary" onclick="jumpLive()">⏭ Live</button>
+      <button class="danger" onclick="stopStream()">⏹ Stop</button>
+    </div>
+    
+    <video id="video" controls autoplay muted playsinline></video>
+    
+    <div class="stats">
+      <div class="card"><div class="label">Latency</div><div class="value" id="lat">—</div></div>
+      <div class="card"><div class="label">Buffer</div><div class="value" id="buf">—</div></div>
+      <div class="card"><div class="label">Bitrate</div><div class="value" id="bit">—</div></div>
+      <div class="card"><div class="label">Resolution</div><div class="value" id="res">—</div></div>
+      <div class="card"><div class="label">Dropped</div><div class="value" id="drop">—</div></div>
+      <div class="card"><div class="label">Status</div><div class="value" id="stat">Idle</div></div>
+    </div>
+    
+    <div class="log" id="log"></div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <script>
+    let hls = null;
+    let statsInterval = null;
+    let currentMode = 'lowlat';
+    let signedQuery = '';
+    let streamStarted = false;
+    
+    const MODES = {
+      lowlat: {
+        name: 'Low Latency',
+        lowLatencyMode: true,
+        liveSyncDurationCount: 2,
+        liveMaxLatencyDurationCount: 4,
+        maxBufferLength: 8,
+        maxMaxBufferLength: 15,
+        backBufferLength: 10,
+        fragLoadingMaxRetry: 3,
+        fragLoadingRetryDelay: 500,
+        fragLoadingTimeOut: 10000
+      },
+      balanced: {
+        name: 'Balanced',
+        lowLatencyMode: false,
+        liveSyncDurationCount: 5,
+        liveMaxLatencyDurationCount: 10,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        backBufferLength: 30,
+        fragLoadingMaxRetry: 6,
+        fragLoadingRetryDelay: 1000,
+        fragLoadingTimeOut: 20000
+      },
+      stable: {
+        name: 'Stable',
+        lowLatencyMode: false,
+        liveSyncDurationCount: 10,
+        liveMaxLatencyDurationCount: 20,
+        maxBufferLength: 60,
+        maxMaxBufferLength: 120,
+        backBufferLength: 60,
+        fragLoadingMaxRetry: 10,
+        fragLoadingRetryDelay: 1000,
+        fragLoadingTimeOut: 30000
+      }
+    };
+    
+    function log(msg, type) {
+      type = type || 'info';
+      const l = document.getElementById('log');
+      const e = document.createElement('div');
+      e.className = 'log-' + type;
+      e.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
+      l.insertBefore(e, l.firstChild);
+      while (l.children.length > 60) l.removeChild(l.lastChild);
+    }
+    
+    function setStat(id, val, cls) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = val;
+      el.className = 'value' + (cls ? ' ' + cls : '');
+    }
+    
+    function setMode(mode, evt) {
+      currentMode = mode;
+      document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+      if (evt && evt.target) evt.target.classList.add('active');
+      log('Mode: ' + MODES[mode].name, 'info');
+      loadStream();
+    }
+    
+    function stopStream() {
+      if (hls) { hls.destroy(); hls = null; }
+      if (statsInterval) { clearInterval(statsInterval); statsInterval = null; }
+      const v = document.getElementById('video');
+      v.pause();
+      v.removeAttribute('src');
+      v.load();
+      setStat('stat', 'Stopped', 'dim');
+      ['lat', 'buf', 'bit', 'res', 'drop'].forEach(id => setStat(id, '—', 'dim'));
+      streamStarted = false;
+    }
+    
+    function jumpLive() {
+      const v = document.getElementById('video');
+      if (v.buffered.length > 0) {
+        v.currentTime = v.buffered.end(v.buffered.length - 1) - 0.5;
+        log('Jumped to live', 'ok');
+      }
+    }
+    
+    async function loadStream() {
+      stopStream();
+      streamStarted = false;
+      
+      const signEndpoint = document.getElementById('signUrl').value.trim();
+      const streamName = document.getElementById('streamName').value.trim() || 'studio1';
+      const cfg = MODES[currentMode];
+      
+      log('Fetching signed URL for: ' + streamName, 'info');
+      setStat('stat', 'Fetching...', 'warn');
+      
+      try {
+        const r = await fetch(signEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stream: streamName, expires_in: 3600 })
+        });
+        
+        if (!r.ok) throw new Error('Sign API ' + r.status);
+        
+        const data = await r.json();
+        log('Signed URL: ' + data.url.substring(0, 80) + '...', 'ok');
+        
+        const urlObj = new URL(data.url);
+        signedQuery = urlObj.search;
+        
+        setStat('stat', 'Loading...', 'warn');
+        const v = document.getElementById('video');
+        
+        if (Hls.isSupported()) {
+          hls = new Hls({
+            lowLatencyMode: cfg.lowLatencyMode,
+            liveSyncDurationCount: cfg.liveSyncDurationCount,
+            liveMaxLatencyDurationCount: cfg.liveMaxLatencyDurationCount,
+            liveDurationInfinity: true,
+            maxBufferLength: cfg.maxBufferLength,
+            maxMaxBufferLength: cfg.maxMaxBufferLength,
+            backBufferLength: cfg.backBufferLength,
+            fragLoadingMaxRetry: cfg.fragLoadingMaxRetry,
+            fragLoadingRetryDelay: cfg.fragLoadingRetryDelay,
+            fragLoadingTimeOut: cfg.fragLoadingTimeOut,
+            startLevel: -1,
+            highBufferWatchdogPeriod: 3,
+            nudgeOffset: 0.2,
+            nudgeMaxRetry: 5,
+            
+            // Append BunnyCDN token params to every request
+            xhrSetup: function(xhr, url) {
+              if (url.indexOf('token=') === -1 && signedQuery) {
+                const newUrl = url + signedQuery;
+                xhr.open('GET', newUrl, true);
+              }
+            }
+          });
+          
+          hls.loadSource(data.url);
+          hls.attachMedia(v);
+          
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            log('Manifest loaded', 'ok');
+            setStat('stat', 'Playing', 'ok');
+            streamStarted = true;
+            v.play().catch(() => log('Autoplay blocked', 'warn'));
+          });
+          
+          hls.on(Hls.Events.ERROR, (e, d) => {
+            if (d.fatal) {
+              log('FATAL: ' + d.details, 'err');
+              setStat('stat', 'Error', 'error');
+              if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                setTimeout(() => hls && hls.startLoad(), 1000);
+              } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                hls.recoverMediaError();
+              }
+            }
+          });
+          
+          v.addEventListener('waiting', () => setStat('stat', 'Buffering', 'warn'));
+          v.addEventListener('playing', () => setStat('stat', 'Playing', 'ok'));
+          
+          statsInterval = setInterval(() => {
+            if (v.buffered.length > 0) {
+              const lat = v.buffered.end(v.buffered.length-1) - v.currentTime;
+              const cls = lat < 5 ? 'ok' : lat < 12 ? 'warn' : 'error';
+              setStat('lat', lat.toFixed(1) + 's', cls);
+              setStat('buf', lat.toFixed(1) + 's');
+            }
+            if (v.videoWidth > 0) setStat('res', v.videoWidth + '×' + v.videoHeight);
+            if (hls.levels && hls.levels[hls.currentLevel]) {
+              setStat('bit', Math.round(hls.levels[hls.currentLevel].bitrate/1000) + ' kbps');
+            }
+            if (v.getVideoPlaybackQuality) {
+              const q = v.getVideoPlaybackQuality();
+              if (q.totalVideoFrames) {
+                const rate = (q.droppedVideoFrames / q.totalVideoFrames * 100).toFixed(1);
+                setStat('drop', q.droppedVideoFrames + ' (' + rate + '%)', rate < 1 ? 'ok' : 'warn');
+              }
+            }
+          }, 500);
+          
+        } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+          v.src = data.url;
+          setStat('stat', 'Native HLS', 'ok');
+          streamStarted = true;
+        }
+      } catch(e) {
+        log('Error: ' + e.message, 'err');
+        setStat('stat', 'Failed', 'error');
+      }
+    }
+    
+    window.addEventListener('load', () => {
+      log('Player ready', 'ok');
+      setTimeout(loadStream, 500);
+    });
+  </script>
+</body>
+</html>

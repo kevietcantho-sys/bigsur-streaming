@@ -1,0 +1,49 @@
+# ═══════════════════════════════════════════════════════════════
+# streaming-auth — default configuration
+# Non-secret defaults. Secrets live in .env only.
+# Env vars override any value here (see src/config/config.loader.ts).
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: 3000
+  bindIp: 0.0.0.0
+  # HAProxy sits in front; trust the first proxy hop for req.ip
+  trustProxy: 1
+  # Max request body size
+  bodyLimit: 16kb
+
+cors:
+  # CSV list or "*". Tighten in production.
+  origins: "*"
+  methods: "GET, POST, OPTIONS"
+  headers: "Content-Type, Authorization"
+
+sign:
+  # Signed URL expiry bounds (seconds)
+  minExpires: 60
+  maxExpires: 3600
+  defaultExpires: 600
+  # Per-IP rate limit at app layer
+  rateLimit:
+    ttl: 60000   # ms
+    limit: 120   # requests per ttl
+
+streams:
+  # Allowed stream name pattern (alphanum + _ -)
+  nameRegex: "^[a-zA-Z0-9_-]{1,64}$"
+
+bunny:
+  # CDN URL (pull zone). Required for /sign to succeed.
+  # Can also be set via env: BUNNY_CDN_URL
+  cdnUrl: ""
+  # tokenKey is a secret — set via env BUNNY_TOKEN_KEY only
+
+origin:
+  # SRS HTTP endpoint (used only for informational health reporting)
+  host: ""
+  port: 8080
+
+logger:
+  level: info
+  # "pretty" for dev, "json" for prod (journald)
+  format: json

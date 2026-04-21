@@ -1,0 +1,27 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Per-user agent tool configs (CLAUDE.md is shared; these dirs are local)
+.claude/
+.opencode/
+
+# Logs
+*.log
+logs/
+
+# Env files — secrets never in git
+.env
+.env.local
+.env.*.local
+
+# Node (belt-and-suspenders; streaming-auth/.gitignore also covers these)
+node_modules/
+dist/
+coverage/
+.nyc_output/
