@@ -635,7 +635,8 @@ setup_srs() {
     log "Installing build dependencies..."
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y build-essential cmake libssl-dev pkg-config git wget curl ufw vnstat htop python3
+    apt-get install -y build-essential cmake automake autoconf libtool patch \
+        libssl-dev pkg-config git wget curl ufw vnstat htop python3
     ok "Dependencies installed"
 
     #─── Hostname ──────────────────────────────────────────────────────────────
