@@ -70,6 +70,20 @@ export const configSchema = z.object({
     tokenKey: z.string(),     // may be empty → /sign fails closed (503)
   }),
 
+  // Publish-URL signing (TencentCloud CSS style: ?txSecret=<md5>&txTime=<hex>)
+  // `/sign/publish` fails closed (503) when pushDomain or signKey are empty.
+  publish: z.object({
+    pushDomain: z.string(),   // e.g. bspush.trangchudangnhap.net
+    app: z.string().min(1),   // RTMP app component (e.g. "luckylive")
+    signKey: z.string(),      // secret, env-only
+    minExpires: z.coerce.number().int().positive(),
+    maxExpires: z.coerce.number().int().positive(),
+    defaultExpires: z.coerce.number().int().positive(),
+  }).refine(
+    (v) => v.minExpires <= v.defaultExpires && v.defaultExpires <= v.maxExpires,
+    { message: 'publish expires bounds must satisfy min <= default <= max' },
+  ),
+
   origin: z.object({
     host: z.string(),
     port: z.coerce.number().int().min(1).max(65535),

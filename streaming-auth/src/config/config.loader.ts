@@ -90,6 +90,14 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
       cdnUrl: env.BUNNY_CDN_URL,
       tokenKey: env.BUNNY_TOKEN_KEY,
     },
+    publish: {
+      pushDomain: env.PUBLISH_DOMAIN,
+      app: env.PUBLISH_APP,
+      signKey: env.PUBLISH_SIGN_KEY,
+      minExpires: env.PUBLISH_MIN_EXPIRES,
+      maxExpires: env.PUBLISH_MAX_EXPIRES,
+      defaultExpires: env.PUBLISH_DEFAULT_EXPIRES,
+    },
     origin: {
       host: env.ORIGIN_HOST,
       port: env.ORIGIN_PORT,
@@ -131,10 +139,11 @@ export function loadConfig(): AppConfig {
     envOverrides(process.env),
   );
 
-  // bunny.tokenKey + apiToken live only in env — inject if absent
+  // Secrets live only in env — inject if absent so the schema sees a string.
   const withSecrets = deepMerge(merged, {
     bunny: { tokenKey: process.env.BUNNY_TOKEN_KEY ?? '' },
     sign: { apiToken: process.env.SIGN_API_TOKEN ?? '' },
+    publish: { signKey: process.env.PUBLISH_SIGN_KEY ?? '' },
   });
 
   const parsed = configSchema.safeParse(withSecrets);

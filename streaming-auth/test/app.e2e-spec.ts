@@ -20,6 +20,9 @@ describe('streaming-auth (e2e)', () => {
       STREAM_KEYS: 'studio1:secret1,studio2:secret2',
       BUNNY_TOKEN_KEY: 'bunny-secret',
       BUNNY_CDN_URL: 'https://stream.b-cdn.net',
+      PUBLISH_DOMAIN: 'bspush.example.com',
+      PUBLISH_APP: 'luckylive',
+      PUBLISH_SIGN_KEY: 'publish-secret',
       LOG_LEVEL: 'error',
       // very high rate limit so tests don't trip throttling
       SIGN_RATE_TTL: '60000',
@@ -132,6 +135,52 @@ describe('streaming-auth (e2e)', () => {
       const nowSec = Math.floor(Date.now() / 1000);
       // maxExpires from default.yaml = 3600
       expect(r.body.expires - nowSec).toBeLessThanOrEqual(3600 + 2);
+    });
+  });
+
+  //─── /sign/publish ─────────────────────────────────────────────
+  describe('POST /sign/publish', () => {
+    it('401 without Bearer token', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/sign/publish')
+        .send({ studio: 'LR-TEST-ABC' });
+      expect(r.status).toBe(401);
+    });
+
+    it('400 on invalid studio name', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/sign/publish')
+        .set('Authorization', `Bearer ${API_TOKEN}`)
+        .send({ studio: 'bad/studio' });
+      expect(r.status).toBe(400);
+    });
+
+    it('200 mints a TencentCloud-style publish URL', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/sign/publish')
+        .set('Authorization', `Bearer ${API_TOKEN}`)
+        .send({ studio: 'LR-MO11R4E8-B823D6', expires_in: 3600 });
+      expect(r.status).toBe(200);
+      expect(r.body.url).toMatch(
+        /^rtmp:\/\/bspush\.example\.com\/luckylive\/LR-MO11R4E8-B823D6\?txSecret=[0-9a-f]{32}&txTime=[0-9a-f]+$/,
+      );
+      expect(r.body.stream).toBe('LR-MO11R4E8-B823D6');
+      expect(typeof r.body.expires).toBe('number');
+      // txTime is hex-encoded unix seconds at expiry
+      expect(parseInt(r.body.txTime, 16)).toBe(r.body.expires);
+    });
+
+    it('signature matches md5(signKey + stream + txTime)', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/sign/publish')
+        .set('Authorization', `Bearer ${API_TOKEN}`)
+        .send({ studio: 'studio1', expires_in: 3600 });
+      expect(r.status).toBe(200);
+      const { createHash } = await import('node:crypto');
+      const expected = createHash('md5')
+        .update('publish-secret' + 'studio1' + r.body.txTime)
+        .digest('hex');
+      expect(r.body.txSecret).toBe(expected);
     });
   });
 });

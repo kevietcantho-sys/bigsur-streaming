@@ -38,6 +38,18 @@ bunny:
   cdnUrl: ""
   # tokenKey is a secret — set via env BUNNY_TOKEN_KEY only
 
+publish:
+  # RTMP publish endpoint (OBS target). Required for /sign/publish.
+  # Can be overridden via env: PUBLISH_DOMAIN
+  pushDomain: ""
+  # RTMP app path component. Env: PUBLISH_APP
+  app: "live"
+  # Expiry bounds for tcSecret tokens (seconds)
+  minExpires: 300
+  maxExpires: 86400
+  defaultExpires: 3600
+  # signKey is a secret — set via env PUBLISH_SIGN_KEY only
+
 origin:
   # SRS HTTP endpoint (used only for informational health reporting)
   host: ""
