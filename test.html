@@ -103,8 +103,11 @@
     </div>
     
     <div class="controls">
-      <input type="text" id="signUrl" value="http://45.76.145.205/sign" placeholder="Sign endpoint">
+      <input type="text" id="signUrl" placeholder="Sign endpoint, e.g. https://api.example.com/sign">
       <input type="text" id="streamName" value="studio1" placeholder="Stream" style="flex: 0 0 150px; min-width: 150px;">
+    </div>
+    <div class="controls">
+      <input type="password" id="signToken" placeholder="SIGN_API_TOKEN (bearer) — stored in localStorage">
       <button onclick="loadStream()">▶ Load</button>
       <button class="secondary" onclick="jumpLive()">⏭ Live</button>
       <button class="danger" onclick="stopStream()">⏹ Stop</button>
@@ -219,22 +222,34 @@
     async function loadStream() {
       stopStream();
       streamStarted = false;
-      
+
       const signEndpoint = document.getElementById('signUrl').value.trim();
+      const signToken = document.getElementById('signToken').value.trim();
       const streamName = document.getElementById('streamName').value.trim() || 'studio1';
       const cfg = MODES[currentMode];
-      
+
+      if (!signEndpoint) { log('Sign endpoint is empty', 'err'); setStat('stat','No endpoint','error'); return; }
+      if (!signToken)    { log('Bearer token is empty', 'err'); setStat('stat','No token','error');    return; }
+
+      // Persist for next reload (bearer stays on this machine only)
+      localStorage.setItem('signUrl', signEndpoint);
+      localStorage.setItem('signToken', signToken);
+      localStorage.setItem('streamName', streamName);
+
       log('Fetching signed URL for: ' + streamName, 'info');
       setStat('stat', 'Fetching...', 'warn');
-      
+
       try {
         const r = await fetch(signEndpoint, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + signToken
+          },
           body: JSON.stringify({ stream: streamName, expires_in: 3600 })
         });
-        
-        if (!r.ok) throw new Error('Sign API ' + r.status);
+
+        if (!r.ok) throw new Error('Sign API ' + r.status + ' — ' + (await r.text()).slice(0, 200));
         
         const data = await r.json();
         log('Signed URL: ' + data.url.substring(0, 80) + '...', 'ok');
@@ -328,8 +343,18 @@
     }
     
     window.addEventListener('load', () => {
+      const savedUrl = localStorage.getItem('signUrl');
+      const savedTok = localStorage.getItem('signToken');
+      const savedStream = localStorage.getItem('streamName');
+      if (savedUrl) document.getElementById('signUrl').value = savedUrl;
+      if (savedTok) document.getElementById('signToken').value = savedTok;
+      if (savedStream) document.getElementById('streamName').value = savedStream;
       log('Player ready', 'ok');
-      setTimeout(loadStream, 500);
+      if (savedUrl && savedTok) {
+        setTimeout(loadStream, 500);
+      } else {
+        log('Enter sign endpoint + bearer token, then click ▶ Load', 'info');
+      }
     });
   </script>
 </body>
