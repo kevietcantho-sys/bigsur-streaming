@@ -24,7 +24,7 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
                                                                      └──────────────────┘
 ```
 
-- **Ingest**: Plain RTMP on `:1935` (Cloudflare cannot proxy RTMP/RTMPS, and OBS rejects the Cloudflare Origin Cert on RTMPS, so ingest stays unencrypted over a direct path). HAProxy forwards to SRS `:1935` over the VPC.
+- **Ingest**: RTMPS on `:1936` (Let's Encrypt cert when `LETSENCRYPT_EMAIL` is set) or plain RTMP on `:1935` otherwise. Cloudflare cannot proxy RTMP/RTMPS, so ingest DNS must be grey-cloud regardless. HAProxy terminates TLS and forwards plain RTMP to SRS `:1935` over the VPC.
 - **Playback origin pull**: BunnyCDN pulls LL-HLS from `https://origin.example.com` (grey-cloud) on `:443` → SRS `:8080` over VPC. BunnyCDN must have **"Verify origin SSL certificate" off** because the Cloudflare Origin Cert is not publicly trusted.
 - **Sign API**: Backend calls `https://api.example.com/sign` (orange-cloud) — Cloudflare terminates public TLS with its Universal SSL cert, then re-encrypts to HAProxy using the Cloudflare Origin Cert.
 - **Viewer playback**: BunnyCDN edge serves the HLS manifest + segments to viewers via the signed URL returned by `/sign`.
@@ -83,8 +83,9 @@ Defaults (override with env vars):
 | `HAPROXY_PUBLIC_IP` | `45.76.145.205` |
 | `PUBLISH_HOST` | _(required)_ — OBS ingest hostname, grey-cloud DNS (e.g. `bspush.example.com`) |
 | `PLAYBACK_ORIGIN_HOST` | _(required)_ — BunnyCDN origin hostname, grey-cloud DNS (e.g. `origin.example.com`) |
-| `SSL_CERT_PATH` | `/etc/ssl/cloudflare/origin.pem` — Cloudflare Origin Certificate |
+| `SSL_CERT_PATH` | `/etc/ssl/cloudflare/origin.pem` — Cloudflare Origin Certificate (for :443) |
 | `SSL_KEY_PATH` | `/etc/ssl/cloudflare/origin.key` — Cloudflare Origin Certificate key |
+| `LETSENCRYPT_EMAIL` | _(optional)_ — if set, script issues a Let's Encrypt cert for `$PUBLISH_HOST` and uses it on :1936 so OBS can publish via RTMPS. Requires public port 80 for HTTP-01 challenge. |
 | `ALLOW_NO_TLS` | `0` — set `1` for dev only |
 
 > Cloudflare does not proxy RTMP/RTMPS (ports 1935/1936). The `PUBLISH_HOST` DNS record **must be grey-cloud** (DNS only). `PLAYBACK_ORIGIN_HOST` should also be grey-cloud so BunnyCDN pulls directly from origin without stacking two CDNs. Use a wildcard Cloudflare Origin Certificate (e.g. `*.example.com`) to cover both hostnames.
@@ -116,18 +117,20 @@ sudo chmod 600 /etc/ssl/cloudflare/origin.key
 cd /root/bigsur-streaming
 PUBLISH_HOST=bspush.example.com \
 PLAYBACK_ORIGIN_HOST=origin.example.com \
+LETSENCRYPT_EMAIL=ops@example.com \
 bash setup-streaming-infra.sh haproxy
 ```
 
 The script will:
-1. Install Node 20, HAProxy, rsync.
-2. Build a combined PEM (`/etc/haproxy/certs/origin.pem`) from `$SSL_CERT_PATH` + `$SSL_KEY_PATH`. One cert serves both `:443` (HLS) and `:1936` (RTMPS) — must cover both hostnames.
-3. Copy `streaming-auth/` → `/opt/streaming-auth/`, run `npm ci && npm run build && npm prune --omit=dev`.
-4. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, stream keys, SRS API creds.
-5. Install the `streaming-auth.service` systemd unit (running `node dist/main.js`).
-6. Write HAProxy config with TLS, rate limits, CORS, and `/sign` + SRS backend routing.
+1. Install Node 20, HAProxy, certbot, rsync.
+2. Build `/etc/haproxy/certs/origin.pem` from `$SSL_CERT_PATH` + `$SSL_KEY_PATH` (CF Origin Cert, bound on `:443`).
+3. If `$LETSENCRYPT_EMAIL` is set: issue a Let's Encrypt cert for `$PUBLISH_HOST` via HTTP-01 on port 80, build `/etc/haproxy/certs/publish.pem`, bind it on `:1936` (RTMPS), and install pre/post/deploy renewal hooks (HAProxy briefly stops for the challenge during renewal).
+4. Copy `streaming-auth/` → `/opt/streaming-auth/`, run `npm ci && npm run build && npm prune --omit=dev`.
+5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, stream keys, SRS API creds.
+6. Install the `streaming-auth.service` systemd unit (running `node dist/main.js`).
+7. Write HAProxy config with TLS, rate limits, CORS, and `/sign` + SRS backend routing.
 
-> **Note on RTMPS and OBS**: OBS validates cert chains publicly, so it will reject the Cloudflare Origin Certificate (it's signed by Cloudflare's private CA, not a public root). Publish with plain RTMP on `:1935` (works as-is) or add a Let's Encrypt cert via DNS-01 for `$PUBLISH_HOST` if you need encrypted ingest.
+> **RTMPS vs RTMP**: OBS validates the cert chain against public CAs on RTMPS. The Cloudflare Origin Certificate is not publicly trusted, so using it on :1936 breaks OBS. The script solves this with Let's Encrypt (set `LETSENCRYPT_EMAIL`). If you skip LE, :1936 falls back to the CF Origin Cert and OBS will reject it — use plain RTMP on :1935 in that case.
 
 Generates credentials at `/root/STREAM_KEYS.txt` (chmod 600). Contains:
 - OBS stream keys (`studio1`, `studio2`)
@@ -172,8 +175,9 @@ Backend calls `https://api.example.com/sign` — no cert pinning needed, standar
 
 ## Publish & Play
 
-**OBS (plain RTMP recommended — OBS rejects the Cloudflare Origin Cert on RTMPS):**
-- Server: `rtmp://$PUBLISH_HOST/live`
+**OBS (RTMPS if `LETSENCRYPT_EMAIL` was set, else plain RTMP):**
+- RTMPS: `rtmps://$PUBLISH_HOST:1936/live`
+- RTMP:  `rtmp://$PUBLISH_HOST/live` (no TLS; fine for trusted networks)
 - Stream key: `studio1?key=<secret>`
 
 **Viewer (via backend):**

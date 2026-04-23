@@ -12,7 +12,7 @@
 #   Viewer ── HTTPS:443 ── BunnyCDN ── HTTPS:443 ── HAProxy ── HTTP ── SRS:8080 (VPC)
 #
 # Hardening applied vs previous version:
-#   [S1]  TLS on 443 (HTTPS) and 1936 (RTMPS) via Cloudflare Origin Certificate
+#   [S1]  TLS on 443 via CF Origin Cert; 1936 (RTMPS) via Let's Encrypt
 #   [S2]  HTTP/80 and RTMP/1935 only redirect or disabled on public iface
 #   [S3]  Services run as non-root dedicated users (streaming-auth, srs)
 #   [S4]  Systemd hardening (NoNewPrivileges, ProtectSystem, etc.)
@@ -57,6 +57,11 @@ SSL_CERT_PATH="${SSL_CERT_PATH:-/etc/ssl/cloudflare/origin.pem}"
 SSL_KEY_PATH="${SSL_KEY_PATH:-/etc/ssl/cloudflare/origin.key}"
 ALLOW_NO_TLS="${ALLOW_NO_TLS:-0}"
 
+# Let's Encrypt for RTMPS on :1936 (publicly-trusted cert for OBS).
+# Requires port 80 reachable from the internet (HTTP-01 challenge).
+# If empty, :1936 falls back to the CF Origin Cert (OBS will reject it).
+LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+
 # Pin SRS version (do NOT use develop in production)
 SRS_VERSION="v6.0-r0"
 
@@ -88,11 +93,14 @@ Required environment variables for HAProxy role:
 
 Optional overrides:
   HAPROXY_VPC_IP, SRS_VPC_IP, HAPROXY_PUBLIC_IP
+  LETSENCRYPT_EMAIL     Enable Let's Encrypt for RTMPS on :1936 (OBS needs a
+                        publicly-trusted cert; CF Origin Cert is rejected).
+                        Requires public port 80 for HTTP-01 challenge.
   ALLOW_NO_TLS=1        Skip TLS (dev only; DO NOT use in production)
 
 Example:
   PUBLISH_HOST=bspush.example.com PLAYBACK_ORIGIN_HOST=origin.example.com \\
-      bash $0 haproxy
+      LETSENCRYPT_EMAIL=ops@example.com bash $0 haproxy
 USAGE
     exit 1
 fi
@@ -129,7 +137,7 @@ setup_haproxy() {
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
         apt-get install -y nodejs
     fi
-    apt-get install -y haproxy ufw vnstat htop curl wget git jq python3
+    apt-get install -y haproxy certbot ufw vnstat htop curl wget git jq python3
     ok "Packages installed (node $(node -v), haproxy $(haproxy -v 2>&1 | head -1 | awk '{print $3}'))"
 
     #─── Hostname ──────────────────────────────────────────────────────────────
@@ -142,11 +150,20 @@ setup_haproxy() {
         ok "Created system user: streaming-auth"
     fi
 
-    #─── TLS certificates via Cloudflare Origin Certificate ────────────────────
-    # One combined PEM serves both PUBLISH_HOST (:1936 RTMPS) and
-    # PLAYBACK_ORIGIN_HOST (:443 HTTPS). The cert MUST cover both hostnames —
-    # use a wildcard (*.yourdomain.com) or list both as SANs when issuing the
-    # Origin Certificate in the Cloudflare dashboard.
+    #─── TLS certificates ──────────────────────────────────────────────────────
+    # Two certs by role:
+    #   /etc/haproxy/certs/origin.pem   — Cloudflare Origin Certificate, used on
+    #                                     :443 (HTTPS). BunnyCDN pulls this; the
+    #                                     pull zone must have "Verify origin SSL"
+    #                                     off (CF Origin CA is not publicly
+    #                                     trusted).
+    #   /etc/haproxy/certs/publish.pem  — Let's Encrypt cert for $PUBLISH_HOST,
+    #                                     used on :1936 (RTMPS). OBS validates
+    #                                     against public roots, so we need LE.
+    #                                     Falls back to origin.pem if
+    #                                     $LETSENCRYPT_EMAIL is unset (OBS will
+    #                                     reject — use plain RTMP :1935 then).
+    RTMPS_CERT_PATH=/etc/haproxy/certs/origin.pem
     if [ "$ALLOW_NO_TLS" != "1" ]; then
         mkdir -p /etc/haproxy/certs
         chmod 750 /etc/haproxy/certs
@@ -156,7 +173,62 @@ setup_haproxy() {
         cat "$SSL_CERT_PATH" "$SSL_KEY_PATH" > /etc/haproxy/certs/origin.pem
         chmod 640 /etc/haproxy/certs/origin.pem
         chown root:haproxy /etc/haproxy/certs/origin.pem
-        ok "TLS configured with Cloudflare Origin Certificate"
+        ok "HTTPS cert ready at /etc/haproxy/certs/origin.pem (Cloudflare Origin)"
+
+        if [ -n "$LETSENCRYPT_EMAIL" ]; then
+            local LE_LIVE="/etc/letsencrypt/live/${PUBLISH_HOST}"
+            if [ ! -f "$LE_LIVE/fullchain.pem" ]; then
+                log "Obtaining Let's Encrypt cert for $PUBLISH_HOST (HTTP-01 on :80)..."
+                # Stop HAProxy if running so certbot --standalone can bind :80.
+                # First-run: haproxy not yet started. Re-run: ~5s downtime.
+                systemctl stop haproxy 2>/dev/null || true
+                certbot certonly --standalone --non-interactive --agree-tos \
+                    -m "$LETSENCRYPT_EMAIL" -d "$PUBLISH_HOST" \
+                    --preferred-challenges http
+                ok "Let's Encrypt cert issued for $PUBLISH_HOST"
+            else
+                ok "Let's Encrypt cert already present for $PUBLISH_HOST"
+            fi
+
+            # Combined PEM for HAProxy :1936
+            cat "$LE_LIVE/fullchain.pem" "$LE_LIVE/privkey.pem" \
+                > /etc/haproxy/certs/publish.pem
+            chmod 640 /etc/haproxy/certs/publish.pem
+            chown root:haproxy /etc/haproxy/certs/publish.pem
+            RTMPS_CERT_PATH=/etc/haproxy/certs/publish.pem
+
+            # Renewal hooks:
+            #   pre   — stop haproxy so certbot can bind :80
+            #   post  — start haproxy back up
+            #   deploy— rebuild combined PEM (runs only on successful renewal)
+            mkdir -p /etc/letsencrypt/renewal-hooks/pre \
+                     /etc/letsencrypt/renewal-hooks/post \
+                     /etc/letsencrypt/renewal-hooks/deploy
+
+            cat > /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh <<'PRE_EOF'
+#!/bin/bash
+systemctl stop haproxy
+PRE_EOF
+            cat > /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh <<'POST_EOF'
+#!/bin/bash
+systemctl start haproxy
+POST_EOF
+            cat > /etc/letsencrypt/renewal-hooks/deploy/haproxy-publish.sh <<HOOK_EOF
+#!/bin/bash
+set -e
+cat /etc/letsencrypt/live/${PUBLISH_HOST}/fullchain.pem \\
+    /etc/letsencrypt/live/${PUBLISH_HOST}/privkey.pem \\
+    > /etc/haproxy/certs/publish.pem
+chmod 640 /etc/haproxy/certs/publish.pem
+chown root:haproxy /etc/haproxy/certs/publish.pem
+HOOK_EOF
+            chmod +x /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh \
+                     /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh \
+                     /etc/letsencrypt/renewal-hooks/deploy/haproxy-publish.sh
+            ok "RTMPS cert: /etc/haproxy/certs/publish.pem (Let's Encrypt, auto-renew)"
+        else
+            warn "LETSENCRYPT_EMAIL unset — :1936 will serve the CF Origin Cert (OBS will reject). Use plain RTMP on :1935."
+        fi
     fi
 
     #─── Auth service (NestJS, build on server) ───────────────────────────────
@@ -371,7 +443,7 @@ frontend https_in
 
 # RTMPS frontend (OBS push over TLS)
 frontend rtmps_in
-    bind *:1936 ssl crt /etc/haproxy/certs/origin.pem
+    bind *:1936 ssl crt ${RTMPS_CERT_PATH}
     mode tcp
     option tcplog
     timeout client 24h
@@ -662,11 +734,22 @@ setup_srs() {
     fi
 
     cd /opt/srs/trunk
+    # Rebuild when binary is missing OR built with sanitizer (ASan adds ~25% CPU
+    # and 2-3x memory; not suitable for production).
+    local needs_build=0
     if [ ! -x "objs/srs" ]; then
+        needs_build=1
+    elif ldd objs/srs 2>/dev/null | grep -q libasan; then
+        warn "Existing SRS binary was built with AddressSanitizer; rebuilding without..."
+        make clean >/dev/null 2>&1 || true
+        needs_build=1
+    fi
+
+    if [ "$needs_build" = "1" ]; then
         log "Compiling SRS (5-10 min)..."
-        ./configure
+        ./configure --sanitizer=off
         make -j"$(nproc)"
-        ok "SRS compiled"
+        ok "SRS compiled (sanitizer=off)"
     else
         ok "SRS binary exists ($(./objs/srs -v 2>&1 | head -1))"
     fi
