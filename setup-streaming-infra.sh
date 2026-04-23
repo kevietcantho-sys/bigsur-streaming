@@ -39,11 +39,20 @@ HAPROXY_PUBLIC_IP="${HAPROXY_PUBLIC_IP:-45.76.145.205}"
 # TLS config — REQUIRED for production
 # Set ALLOW_NO_TLS=1 to skip (dev/testing only, NOT recommended)
 #
-# Using Cloudflare Origin Certificate (generated in Cloudflare dashboard:
-# SSL/TLS → Origin Server → Create Certificate). Upload both files to the
-# HAProxy box before running this script, then point the vars below at them.
-# Cloudflare's SSL/TLS mode should be "Full (strict)".
-DOMAIN="${DOMAIN:-}"                    # e.g. stream.example.com (orange-cloud A record → HAPROXY_PUBLIC_IP)
+# Two public hostnames are required (both resolve to HAPROXY_PUBLIC_IP):
+#
+#   PUBLISH_HOST          — OBS push endpoint (RTMPS/RTMP). MUST be grey-cloud
+#                           (DNS only) in Cloudflare since CF does not proxy
+#                           ports 1935/1936.
+#   PLAYBACK_ORIGIN_HOST  — HLS origin that BunnyCDN pulls from. Recommend
+#                           grey-cloud to avoid stacking two CDNs.
+#
+# TLS certificate (Cloudflare Origin Certificate) must be valid for BOTH
+# hostnames. Easiest: issue a wildcard for *.yourdomain.com in Cloudflare
+# dashboard (SSL/TLS → Origin Server → Create Certificate), then upload to
+# $SSL_CERT_PATH + $SSL_KEY_PATH. Cloudflare SSL/TLS mode: "Full (strict)".
+PUBLISH_HOST="${PUBLISH_HOST:-}"                  # e.g. bspush.example.com
+PLAYBACK_ORIGIN_HOST="${PLAYBACK_ORIGIN_HOST:-}"  # e.g. origin.example.com
 SSL_CERT_PATH="${SSL_CERT_PATH:-/etc/ssl/cloudflare/origin.pem}"
 SSL_KEY_PATH="${SSL_KEY_PATH:-/etc/ssl/cloudflare/origin.key}"
 ALLOW_NO_TLS="${ALLOW_NO_TLS:-0}"
@@ -72,16 +81,18 @@ Usage: bash $0 <haproxy|srs>
   srs      = Setup SRS streaming server (LL-HLS + HTTP-FLV)
 
 Required environment variables for HAProxy role:
-  DOMAIN               Public hostname (A record → HAPROXY_PUBLIC_IP, proxied via Cloudflare)
-  SSL_CERT_PATH        Path to Cloudflare Origin Certificate (default: /etc/ssl/cloudflare/origin.pem)
-  SSL_KEY_PATH         Path to Cloudflare Origin Certificate key (default: /etc/ssl/cloudflare/origin.key)
+  PUBLISH_HOST          OBS ingest hostname (grey-cloud DNS → HAPROXY_PUBLIC_IP)
+  PLAYBACK_ORIGIN_HOST  HLS origin pulled by BunnyCDN (grey-cloud → HAPROXY_PUBLIC_IP)
+  SSL_CERT_PATH         Cloudflare Origin Cert (default: /etc/ssl/cloudflare/origin.pem)
+  SSL_KEY_PATH          Cloudflare Origin Cert key (default: /etc/ssl/cloudflare/origin.key)
 
 Optional overrides:
   HAPROXY_VPC_IP, SRS_VPC_IP, HAPROXY_PUBLIC_IP
-  ALLOW_NO_TLS=1       Skip TLS (dev only; DO NOT use in production)
+  ALLOW_NO_TLS=1        Skip TLS (dev only; DO NOT use in production)
 
 Example:
-  DOMAIN=stream.example.com bash $0 haproxy
+  PUBLISH_HOST=bspush.example.com PLAYBACK_ORIGIN_HOST=origin.example.com \\
+      bash $0 haproxy
 USAGE
     exit 1
 fi
@@ -91,7 +102,8 @@ fi
 # Validate TLS config for haproxy role
 if [ "$ROLE" = "haproxy" ]; then
     if [ "$ALLOW_NO_TLS" != "1" ]; then
-        [ -z "$DOMAIN" ] && err "DOMAIN not set. Export DOMAIN=your.host or set ALLOW_NO_TLS=1 for dev."
+        [ -z "$PUBLISH_HOST" ]         && err "PUBLISH_HOST not set (e.g. bspush.example.com)."
+        [ -z "$PLAYBACK_ORIGIN_HOST" ] && err "PLAYBACK_ORIGIN_HOST not set (e.g. origin.example.com)."
         [ -f "$SSL_CERT_PATH" ] || err "SSL_CERT_PATH not found: $SSL_CERT_PATH. Upload Cloudflare Origin Certificate first."
         [ -f "$SSL_KEY_PATH" ]  || err "SSL_KEY_PATH not found: $SSL_KEY_PATH. Upload Cloudflare Origin private key first."
     else
@@ -131,19 +143,19 @@ setup_haproxy() {
     fi
 
     #─── TLS certificates via Cloudflare Origin Certificate ────────────────────
-    # Cloudflare terminates the public TLS (client→CF). This cert secures the
-    # CF→origin leg and must be trusted by Cloudflare. Generate it in the CF
-    # dashboard (SSL/TLS → Origin Server → Create Certificate), then upload to
-    # $SSL_CERT_PATH and $SSL_KEY_PATH on this box. Default validity: 15 years.
+    # One combined PEM serves both PUBLISH_HOST (:1936 RTMPS) and
+    # PLAYBACK_ORIGIN_HOST (:443 HTTPS). The cert MUST cover both hostnames —
+    # use a wildcard (*.yourdomain.com) or list both as SANs when issuing the
+    # Origin Certificate in the Cloudflare dashboard.
     if [ "$ALLOW_NO_TLS" != "1" ]; then
         mkdir -p /etc/haproxy/certs
         chmod 750 /etc/haproxy/certs
         chown root:haproxy /etc/haproxy/certs
 
         log "Building combined PEM from $SSL_CERT_PATH + $SSL_KEY_PATH..."
-        cat "$SSL_CERT_PATH" "$SSL_KEY_PATH" > "/etc/haproxy/certs/${DOMAIN}.pem"
-        chmod 640 "/etc/haproxy/certs/${DOMAIN}.pem"
-        chown root:haproxy "/etc/haproxy/certs/${DOMAIN}.pem"
+        cat "$SSL_CERT_PATH" "$SSL_KEY_PATH" > /etc/haproxy/certs/origin.pem
+        chmod 640 /etc/haproxy/certs/origin.pem
+        chown root:haproxy /etc/haproxy/certs/origin.pem
         ok "TLS configured with Cloudflare Origin Certificate"
     fi
 
@@ -232,14 +244,14 @@ EOF
   KEEP THIS FILE PRIVATE. chmod 600.
 
   === OBS PUBLISHER ===
-  Server (RTMPS):  rtmps://${DOMAIN:-$HAPROXY_PUBLIC_IP}:1936/live
-  Server (RTMP):   rtmp://${DOMAIN:-$HAPROXY_PUBLIC_IP}/live   # fallback only
+  Server (RTMPS):  rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/live
+  Server (RTMP):   rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/live   # fallback only
   Stream keys:
     studio1?key=$STUDIO1_KEY
     studio2?key=$STUDIO2_KEY
 
   === BACKEND → AUTH API ===
-  Sign endpoint:   https://${DOMAIN:-$HAPROXY_PUBLIC_IP}/sign
+  Sign endpoint:   https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign
   Authorization header: Bearer $SIGN_API_TOKEN
 
   === SRS HTTP API (internal monitoring) ===
@@ -248,8 +260,8 @@ EOF
   (Set the same values on the SRS box; used by on the srs role below.)
 
   === NEXT STEPS ===
-  1) Create BunnyCDN pull zone pointing origin to:
-       https://${DOMAIN:-$HAPROXY_PUBLIC_IP}
+  1) Create BunnyCDN pull zone. Origin URL:
+       https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}
   2) Enable Token Authentication in BunnyCDN; copy the security key.
   3) Update /opt/streaming-auth/.env:
        BUNNY_TOKEN_KEY=<key from BunnyCDN>
@@ -332,7 +344,7 @@ UNIT_EOF
         TLS_FRONTEND_HTTP="
 # HTTPS frontend (TLS terminated here; backend is plain HTTP over VPC)
 frontend https_in
-    bind *:443 ssl crt /etc/haproxy/certs/${DOMAIN}.pem alpn h2,http/1.1
+    bind *:443 ssl crt /etc/haproxy/certs/origin.pem alpn h2,http/1.1
     mode http
     option httplog
     option http-keep-alive
@@ -359,7 +371,7 @@ frontend https_in
 
 # RTMPS frontend (OBS push over TLS)
 frontend rtmps_in
-    bind *:1936 ssl crt /etc/haproxy/certs/${DOMAIN}.pem
+    bind *:1936 ssl crt /etc/haproxy/certs/origin.pem
     mode tcp
     option tcplog
     timeout client 24h
@@ -568,7 +580,8 @@ SYSCTL_EOF
     echo "  HAPROXY-EDGE SETUP COMPLETE"
     echo "═══════════════════════════════════════════════════════════════"
     echo "  Public IP:        $HAPROXY_PUBLIC_IP"
-    echo "  Domain:           ${DOMAIN:-(not set — ALLOW_NO_TLS mode)}"
+    echo "  Publish host:     ${PUBLISH_HOST:-(not set — ALLOW_NO_TLS mode)}"
+    echo "  Playback origin:  ${PLAYBACK_ORIGIN_HOST:-(not set — ALLOW_NO_TLS mode)}"
     echo "  VPC IP:           $HAPROXY_VPC_IP"
     echo "  SRS Origin:       $SRS_VPC_IP"
     echo ""
@@ -583,7 +596,7 @@ SYSCTL_EOF
     echo "  Next steps:"
     echo "    1) Run on SRS box:  SRS_API_USER=admin SRS_API_PASS=<from STREAM_KEYS.txt> bash $0 srs"
     echo "    2) Configure BunnyCDN; update .env; systemctl restart streaming-auth"
-    echo "    3) OBS publish:   rtmps://${DOMAIN:-$HAPROXY_PUBLIC_IP}:1936/live"
+    echo "    3) OBS publish:   rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/live"
     echo "═══════════════════════════════════════════════════════════════"
 }
 
