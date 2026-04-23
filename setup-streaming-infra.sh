@@ -572,6 +572,13 @@ backend srs_origin
     http-reuse safe
     timeout connect 3s
     timeout server 30s
+    # Cache hints so BunnyCDN can honor origin freshness (Pull Zone →
+    # Caching → "Respect origin cache control" should be enabled).
+    # Live manifests change every fragment — keep cache very short.
+    http-response set-header Cache-Control "public, max-age=1" if { path_end .m3u8 }
+    # Segments are immutable once written — aggressive caching is safe.
+    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { path_end .ts }
+    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { path_end .m4s }
     server origin1 ${SRS_VPC_IP}:8080 check inter 10s rise 2 fall 3 maxconn 1000
 
 backend auth_service

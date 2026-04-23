@@ -149,17 +149,49 @@ bash setup-streaming-infra.sh srs
 
 ### 3. BunnyCDN
 
-1. Create pull zone → origin URL: `https://<PLAYBACK_ORIGIN_HOST>`
+**Pull zone basics**
+1. Create pull zone → origin URL: `https://<PLAYBACK_ORIGIN_HOST>`.
 2. Pull Zone → **Origin** → turn **"Verify origin SSL certificate" off** (the Cloudflare Origin Cert is issued by Cloudflare's private CA and not publicly trusted; traffic remains TLS-encrypted regardless).
-3. Enable **Token Authentication**, copy the security key.
-4. On haproxy box, edit `/opt/streaming-auth/.env`:
-   ```
-   BUNNY_TOKEN_KEY=<bunny security key>
-   BUNNY_CDN_URL=https://<pullzone>.b-cdn.net
-   ```
-5. `systemctl restart streaming-auth`
 
-Until step 4, `/sign` returns **503 cdn_not_configured** (fail-closed).
+**Caching** — let origin Cache-Control headers drive freshness (HAProxy sets them automatically since commit `feat: HAProxy Cache-Control headers`):
+3. Pull Zone → **Caching** → enable **"Respect origin cache control"**.
+4. Keep one safety-net Edge Rule: `Status Code = 404, 502, 503, 504` → Override Cache Time = `1 second` (prevents poisoned negative caches during origin hiccups).
+5. (Optional) Pull Zone → **Caching** → enable compression (Brotli + gzip) — manifests are text, small win on mobile.
+
+**Token Authentication** — signed URLs, required for `/sign` to work end-to-end:
+6. Pull Zone → **Security** → **Token Authentication** → enable.
+7. Copy the **Authentication Key** (shown once).
+8. **Don't enable "Token IP Validation"** at the zone level — the signer handles that per-request via the `viewer_ip` field. Zone-wide IP pinning breaks NAT'd mobile viewers.
+9. No need to touch "Allowed Referrers" unless you also want hotlink protection on top of tokens.
+
+**Wire secrets into the auth service** — on the haproxy box edit `/opt/streaming-auth/.env`:
+```
+BUNNY_TOKEN_KEY=<authentication key from step 7>
+BUNNY_CDN_URL=https://<pullzone>.b-cdn.net
+```
+Then `systemctl restart streaming-auth`. Until this, `/sign` returns **503 cdn_not_configured** (fail-closed).
+
+**How the signer works** (for reference, `streaming-auth/src/modules/sign/bunny.service.ts`):
+- Signs with path-prefix mode: `md5(BUNNY_TOKEN_KEY + "/live/" + expires [+ viewer_ip])`
+- Includes `token_path=/live/` in the URL — same token validates for the `.m3u8` manifest *and* every `.ts` / `.m4s` segment under `/live/`
+- Adds `&expires=<unix_ts>` — absolute timestamp (not TTL)
+- Optional `viewer_ip` pins the token to a single client IP
+
+**Verify end-to-end after setup**:
+```bash
+# Unsigned request — must 403
+curl -s -o /dev/null -w '%{http_code}\n' \
+  https://<pullzone>.b-cdn.net/live/studio1.m3u8
+# → 403
+
+# Signed request via /sign — must play
+TOKEN=$(sudo grep 'Authorization' /root/STREAM_KEYS.txt | awk '{print $3}')
+curl -s -X POST https://<PLAYBACK_ORIGIN_HOST>/sign \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"stream":"studio1","expires_in":300}' | jq -r .url | \
+  xargs -I {} curl -I {}
+# → HTTP/2 200  (content-type: application/vnd.apple.mpegurl)
+```
 
 ### 4. Backend → `/sign` API (optional: via Cloudflare)
 
