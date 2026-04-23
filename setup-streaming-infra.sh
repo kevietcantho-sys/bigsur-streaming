@@ -12,7 +12,7 @@
 #   Viewer ── HTTPS:443 ── BunnyCDN ── HTTPS:443 ── HAProxy ── HTTP ── SRS:8080 (VPC)
 #
 # Hardening applied vs previous version:
-#   [S1]  TLS on 443 (HTTPS) and 1936 (RTMPS) via Let's Encrypt
+#   [S1]  TLS on 443 (HTTPS) and 1936 (RTMPS) via Cloudflare Origin Certificate
 #   [S2]  HTTP/80 and RTMP/1935 only redirect or disabled on public iface
 #   [S3]  Services run as non-root dedicated users (streaming-auth, srs)
 #   [S4]  Systemd hardening (NoNewPrivileges, ProtectSystem, etc.)
@@ -25,7 +25,6 @@
 #   [S11] set -euo pipefail; errors no longer silenced
 #   [S12] Systemd restart loops bounded (StartLimitBurst)
 #   [S13] Log rotation via journald (no unbounded /var/log files)
-#   [S14] Certbot auto-renew deploy hook for HAProxy cert reload
 #═══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -39,8 +38,14 @@ HAPROXY_PUBLIC_IP="${HAPROXY_PUBLIC_IP:-45.76.145.205}"
 
 # TLS config — REQUIRED for production
 # Set ALLOW_NO_TLS=1 to skip (dev/testing only, NOT recommended)
-DOMAIN="${DOMAIN:-}"                    # e.g. stream.example.com (A record → HAPROXY_PUBLIC_IP)
-LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
+#
+# Using Cloudflare Origin Certificate (generated in Cloudflare dashboard:
+# SSL/TLS → Origin Server → Create Certificate). Upload both files to the
+# HAProxy box before running this script, then point the vars below at them.
+# Cloudflare's SSL/TLS mode should be "Full (strict)".
+DOMAIN="${DOMAIN:-}"                    # e.g. stream.example.com (orange-cloud A record → HAPROXY_PUBLIC_IP)
+SSL_CERT_PATH="${SSL_CERT_PATH:-/etc/ssl/cloudflare/origin.pem}"
+SSL_KEY_PATH="${SSL_KEY_PATH:-/etc/ssl/cloudflare/origin.key}"
 ALLOW_NO_TLS="${ALLOW_NO_TLS:-0}"
 
 # Pin SRS version (do NOT use develop in production)
@@ -67,15 +72,16 @@ Usage: bash $0 <haproxy|srs>
   srs      = Setup SRS streaming server (LL-HLS + HTTP-FLV)
 
 Required environment variables for HAProxy role:
-  DOMAIN               Public hostname (A record → HAPROXY_PUBLIC_IP)
-  LETSENCRYPT_EMAIL    Email for Let's Encrypt registration
+  DOMAIN               Public hostname (A record → HAPROXY_PUBLIC_IP, proxied via Cloudflare)
+  SSL_CERT_PATH        Path to Cloudflare Origin Certificate (default: /etc/ssl/cloudflare/origin.pem)
+  SSL_KEY_PATH         Path to Cloudflare Origin Certificate key (default: /etc/ssl/cloudflare/origin.key)
 
 Optional overrides:
   HAPROXY_VPC_IP, SRS_VPC_IP, HAPROXY_PUBLIC_IP
   ALLOW_NO_TLS=1       Skip TLS (dev only; DO NOT use in production)
 
 Example:
-  DOMAIN=stream.example.com LETSENCRYPT_EMAIL=ops@example.com bash $0 haproxy
+  DOMAIN=stream.example.com bash $0 haproxy
 USAGE
     exit 1
 fi
@@ -86,7 +92,8 @@ fi
 if [ "$ROLE" = "haproxy" ]; then
     if [ "$ALLOW_NO_TLS" != "1" ]; then
         [ -z "$DOMAIN" ] && err "DOMAIN not set. Export DOMAIN=your.host or set ALLOW_NO_TLS=1 for dev."
-        [ -z "$LETSENCRYPT_EMAIL" ] && err "LETSENCRYPT_EMAIL not set."
+        [ -f "$SSL_CERT_PATH" ] || err "SSL_CERT_PATH not found: $SSL_CERT_PATH. Upload Cloudflare Origin Certificate first."
+        [ -f "$SSL_KEY_PATH" ]  || err "SSL_KEY_PATH not found: $SSL_KEY_PATH. Upload Cloudflare Origin private key first."
     else
         warn "ALLOW_NO_TLS=1 — TLS disabled. DO NOT use this in production."
     fi
@@ -110,7 +117,7 @@ setup_haproxy() {
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
         apt-get install -y nodejs
     fi
-    apt-get install -y haproxy certbot ufw vnstat htop curl wget git jq python3
+    apt-get install -y haproxy ufw vnstat htop curl wget git jq python3
     ok "Packages installed (node $(node -v), haproxy $(haproxy -v 2>&1 | head -1 | awk '{print $3}'))"
 
     #─── Hostname ──────────────────────────────────────────────────────────────
@@ -123,45 +130,21 @@ setup_haproxy() {
         ok "Created system user: streaming-auth"
     fi
 
-    #─── TLS certificates via Let's Encrypt ────────────────────────────────────
+    #─── TLS certificates via Cloudflare Origin Certificate ────────────────────
+    # Cloudflare terminates the public TLS (client→CF). This cert secures the
+    # CF→origin leg and must be trusted by Cloudflare. Generate it in the CF
+    # dashboard (SSL/TLS → Origin Server → Create Certificate), then upload to
+    # $SSL_CERT_PATH and $SSL_KEY_PATH on this box. Default validity: 15 years.
     if [ "$ALLOW_NO_TLS" != "1" ]; then
         mkdir -p /etc/haproxy/certs
         chmod 750 /etc/haproxy/certs
         chown root:haproxy /etc/haproxy/certs
 
-        if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
-            log "Obtaining Let's Encrypt certificate for ${DOMAIN}..."
-            # Stop haproxy if running so certbot standalone can bind :80
-            systemctl stop haproxy 2>/dev/null || true
-            certbot certonly --standalone --non-interactive --agree-tos \
-                -m "$LETSENCRYPT_EMAIL" -d "$DOMAIN" \
-                --preferred-challenges http
-            ok "Certificate issued for ${DOMAIN}"
-        else
-            ok "Certificate already exists for ${DOMAIN}"
-        fi
-
-        # Combined PEM for HAProxy (fullchain + privkey)
-        cat "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" \
-            "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" \
-            > "/etc/haproxy/certs/${DOMAIN}.pem"
+        log "Building combined PEM from $SSL_CERT_PATH + $SSL_KEY_PATH..."
+        cat "$SSL_CERT_PATH" "$SSL_KEY_PATH" > "/etc/haproxy/certs/${DOMAIN}.pem"
         chmod 640 "/etc/haproxy/certs/${DOMAIN}.pem"
         chown root:haproxy "/etc/haproxy/certs/${DOMAIN}.pem"
-
-        # Auto-renew: deploy hook rebuilds combined PEM + reloads HAProxy
-        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-        cat > /etc/letsencrypt/renewal-hooks/deploy/haproxy.sh <<HOOK_EOF
-#!/bin/bash
-set -e
-cat /etc/letsencrypt/live/${DOMAIN}/fullchain.pem \\
-    /etc/letsencrypt/live/${DOMAIN}/privkey.pem \\
-    > /etc/haproxy/certs/${DOMAIN}.pem
-chmod 640 /etc/haproxy/certs/${DOMAIN}.pem
-chown root:haproxy /etc/haproxy/certs/${DOMAIN}.pem
-systemctl reload haproxy
-HOOK_EOF
-        chmod +x /etc/letsencrypt/renewal-hooks/deploy/haproxy.sh
-        ok "TLS configured; auto-renew hook installed"
+        ok "TLS configured with Cloudflare Origin Certificate"
     fi
 
     #─── Auth service (NestJS, build on server) ───────────────────────────────
