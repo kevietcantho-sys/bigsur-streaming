@@ -65,6 +65,16 @@ LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 # Pin SRS version (do NOT use develop in production)
 SRS_VERSION="v6.0-r0"
 
+# Bunny edge IP allowlist on HLS pull paths.
+# off (default) | monitor (log only) | enforce (deny 403)
+BUNNY_EDGE_GUARD="${BUNNY_EDGE_GUARD:-off}"
+case "$BUNNY_EDGE_GUARD" in
+    off|monitor|enforce) ;;
+    *) echo "[FAIL] BUNNY_EDGE_GUARD must be off|monitor|enforce (got: $BUNNY_EDGE_GUARD)" >&2; exit 1 ;;
+esac
+BUNNY_EDGES_LIST="/etc/haproxy/lists/bunny-edges.lst"
+BUNNY_EDGES_REFRESHER="/usr/local/sbin/refresh-bunny-edges.sh"
+
 #───────────────────────────────────────────────────────────────────────────────
 # Colors / logging
 #───────────────────────────────────────────────────────────────────────────────
@@ -97,6 +107,12 @@ Optional overrides:
                         publicly-trusted cert; CF Origin Cert is rejected).
                         Requires public port 80 for HTTP-01 challenge.
   ALLOW_NO_TLS=1        Skip TLS (dev only; DO NOT use in production)
+  BUNNY_EDGE_GUARD      Restrict HLS pull paths to BunnyCDN edge IPs. Refresh
+                        script + hourly cron are always installed; this var
+                        only controls whether the HAProxy ACL is emitted.
+                          off       (default) no ACL — keep current behavior
+                          monitor   log non-Bunny hits at alert level, allow
+                          enforce   return 403 to non-Bunny hits
 
 Example:
   PUBLISH_HOST=bspush.example.com PLAYBACK_ORIGIN_HOST=origin.example.com \\
@@ -118,6 +134,144 @@ if [ "$ROLE" = "haproxy" ]; then
         warn "ALLOW_NO_TLS=1 — TLS disabled. DO NOT use this in production."
     fi
 fi
+
+#═══════════════════════════════════════════════════════════════════════════════
+# BunnyCDN edge IP refresher
+#  Pulls api.bunny.net/system/edgeserverlist{,/IPv6}/plain hourly, atomically
+#  updates the HAProxy ACL file, reloads HAProxy on diff. Idempotent: re-running
+#  setup just rewrites script + cron and re-seeds.
+#═══════════════════════════════════════════════════════════════════════════════
+install_bunny_edge_refresher() {
+    log "Installing BunnyCDN edge IP refresher..."
+
+    mkdir -p /etc/haproxy/lists
+    chown root:haproxy /etc/haproxy/lists 2>/dev/null || true
+    chmod 750 /etc/haproxy/lists
+
+    cat > "$BUNNY_EDGES_REFRESHER" <<'REFRESH_EOF'
+#!/bin/bash
+#
+# refresh-bunny-edges.sh
+# Pulls BunnyCDN's published edge-server IP lists, validates and dedupes,
+# atomically replaces /etc/haproxy/lists/bunny-edges.lst, and reloads HAProxy
+# only when the file actually changed.
+#
+# Installed by setup-streaming-infra.sh. Run hourly via /etc/cron.d/bunny-edges.
+#
+# Exit codes:
+#   0  success (changed or unchanged)
+#   1  hard fetch / validation failure (no destructive change made)
+#
+
+set -euo pipefail
+
+LIST_PATH=/etc/haproxy/lists/bunny-edges.lst
+LOCK=/run/refresh-bunny-edges.lock
+V4_URL="https://api.bunny.net/system/edgeserverlist/plain"
+V6_URL="https://api.bunny.net/system/edgeserverlist/IPv6/plain"
+MIN_IPS=30   # sanity floor — Bunny has ~80+ POPs; smaller suggests a bad fetch
+
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# Single-flight: skip if another run holds the lock.
+exec 9>"$LOCK"
+flock -n 9 || { logger -t bunny-edges "another instance running; skip"; exit 0; }
+
+fetch_to() {
+    local url="$1" out="$2"
+    curl -sSL --fail --max-time 15 --retry 3 --retry-delay 2 -o "$out" "$url"
+}
+
+if ! fetch_to "$V4_URL" "$WORK/v4"; then
+    logger -t bunny-edges "ERROR: IPv4 fetch failed; aborting"
+    exit 1
+fi
+
+# IPv6 is best-effort — Bunny may serve an empty/missing v6 list in some regions.
+if ! fetch_to "$V6_URL" "$WORK/v6"; then
+    logger -t bunny-edges "WARN: IPv6 fetch failed; proceeding with IPv4 only"
+    : > "$WORK/v6"
+fi
+
+# Validate (bare IP or CIDR; reject everything else), strip CR, dedupe, sort.
+cat "$WORK/v4" "$WORK/v6" \
+    | tr -d '\r' \
+    | grep -E '^[0-9a-fA-F:./]+$' \
+    | awk 'NF' \
+    | sort -u > "$WORK/clean"
+
+count=$(wc -l < "$WORK/clean" | tr -d ' ')
+
+if [ "$count" -lt "$MIN_IPS" ]; then
+    logger -t bunny-edges "ERROR: only $count IPs after validation (need ≥${MIN_IPS}); aborting — keeping existing list"
+    exit 1
+fi
+
+if [ -f "$LIST_PATH" ] && cmp -s "$WORK/clean" "$LIST_PATH"; then
+    logger -t bunny-edges "no change ($count IPs)"
+    exit 0
+fi
+
+# Atomic replace.
+install -m 0644 -o root -g haproxy "$WORK/clean" "$LIST_PATH.new" 2>/dev/null \
+    || install -m 0644 "$WORK/clean" "$LIST_PATH.new"
+mv -f "$LIST_PATH.new" "$LIST_PATH"
+
+logger -t bunny-edges "updated: $count IPs; reloading haproxy"
+if systemctl is-active --quiet haproxy; then
+    systemctl reload haproxy || logger -t bunny-edges "WARN: haproxy reload failed"
+fi
+REFRESH_EOF
+    chmod 0755 "$BUNNY_EDGES_REFRESHER"
+    chown root:root "$BUNNY_EDGES_REFRESHER"
+    ok "Wrote $BUNNY_EDGES_REFRESHER"
+
+    # Cron: hourly + at boot. Spread minute offset to avoid the top-of-hour herd.
+    cat > /etc/cron.d/bunny-edges <<CRON_EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Refresh BunnyCDN edge IP list — keeps HAProxy ACL in sync with Bunny's
+# published edge POPs. See $BUNNY_EDGES_REFRESHER for fetch + reload logic.
+@reboot      root  sleep 30 && $BUNNY_EDGES_REFRESHER
+17 * * * *   root  $BUNNY_EDGES_REFRESHER
+CRON_EOF
+    chmod 0644 /etc/cron.d/bunny-edges
+    ok "Installed /etc/cron.d/bunny-edges (hourly + at boot)"
+
+    # Seed the list now so HAProxy has a non-empty file at first start.
+    log "Seeding $BUNNY_EDGES_LIST from api.bunny.net..."
+    if "$BUNNY_EDGES_REFRESHER"; then
+        if [ -s "$BUNNY_EDGES_LIST" ]; then
+            local seeded
+            seeded=$(wc -l < "$BUNNY_EDGES_LIST" | tr -d ' ')
+            ok "Seeded Bunny edge list ($seeded IPs)"
+        fi
+    else
+        warn "Initial Bunny edge fetch failed — cron will retry hourly"
+        # HAProxy needs a readable file even when guard=off (the ACL load
+        # would still error out if we ever flip it on without seeding).
+        # Write a placeholder that matches nothing routable so the file exists.
+        if [ ! -f "$BUNNY_EDGES_LIST" ]; then
+            echo "0.0.0.0/32" > "$BUNNY_EDGES_LIST"
+            chmod 0644 "$BUNNY_EDGES_LIST"
+            warn "Wrote placeholder $BUNNY_EDGES_LIST (cron will replace)"
+        fi
+    fi
+
+    # Refuse to enable enforce mode on a stub list — that would 403 everything.
+    if [ "$BUNNY_EDGE_GUARD" = "enforce" ] && [ ! -s "$BUNNY_EDGES_LIST" ]; then
+        err "BUNNY_EDGE_GUARD=enforce but list is empty. Run $BUNNY_EDGES_REFRESHER first."
+    fi
+    if [ "$BUNNY_EDGE_GUARD" = "enforce" ]; then
+        local seeded
+        seeded=$(wc -l < "$BUNNY_EDGES_LIST" | tr -d ' ')
+        if [ "$seeded" -lt 30 ]; then
+            err "BUNNY_EDGE_GUARD=enforce but list has only $seeded IPs — looks stub. Run $BUNNY_EDGES_REFRESHER first."
+        fi
+    fi
+}
 
 #═══════════════════════════════════════════════════════════════════════════════
 # HAPROXY EDGE SETUP
@@ -267,8 +421,11 @@ HOOK_EOF
 
     # Generate keys if .env doesn't exist
     if [ ! -f "$APP_DIR/.env" ]; then
-        SIGN_API_TOKEN=$(openssl rand -hex 32)
-        PUBLISH_SIGN_KEY=$(openssl rand -hex 32)
+        # Bootstrap a single tenant ("default") so the service starts.
+        # Add more tenants by appending SIGN_API_TOKEN_<NAME> + PUBLISH_SIGN_KEY_<NAME>
+        # pairs to .env and restarting; no other config change needed.
+        DEFAULT_TENANT_TOKEN=$(openssl rand -hex 32)
+        DEFAULT_TENANT_KEY=$(openssl rand -hex 32)
         SRS_API_PASS=$(openssl rand -hex 16)
 
         cat > "$APP_DIR/.env" <<EOF
@@ -277,8 +434,16 @@ HOOK_EOF
 # Base defaults live in config/default.yaml. Env vars win over YAML.
 # ═══════════════════════════════════════════════════════════════
 
-# Bearer token required to call POST /sign/publish (backend only)
-SIGN_API_TOKEN=$SIGN_API_TOKEN
+# ── Per-tenant bearer + push key ──────────────────────────────────
+# Pattern: SIGN_API_TOKEN_<TENANT>   — bearer for POST /sign/publish
+#          PUBLISH_SIGN_KEY_<TENANT> — md5 input for txSecret signing
+# <TENANT> is uppercase; the tenant id appears lowercase in stream
+# names (<tenant>__<studio>) and URLs.
+#
+# Every tenant must have BOTH vars set; mismatched pairs fail boot.
+# Bootstrap tenant: "default" (rename / add more as you onboard).
+SIGN_API_TOKEN_DEFAULT=$DEFAULT_TENANT_TOKEN
+PUBLISH_SIGN_KEY_DEFAULT=$DEFAULT_TENANT_KEY
 
 # BunnyCDN — playback signing moved to clients (each tenant holds its own
 # pull zone + token key). These fields are kept for the reference signer
@@ -287,11 +452,11 @@ BUNNY_TOKEN_KEY=
 BUNNY_CDN_URL=
 
 # Publish URL signing (txSecret/txTime)
-# Single global key today — SRS on_publish recomputes md5(key + stream + txTime).
-# /sign/publish + /srs/publish fail closed (403/503) until both are set.
+# pushDomain is the shared RTMP ingress; per-tenant signing keys above.
+# /sign/publish + /srs/publish fail closed (403/503) until pushDomain
+# is set and the tenant has a configured push key.
 PUBLISH_DOMAIN=${PUBLISH_HOST:-}
 PUBLISH_APP=luckylive
-PUBLISH_SIGN_KEY=$PUBLISH_SIGN_KEY
 # Auto-enabled when LETSENCRYPT_EMAIL was set (LE cert bound on :1936)
 PUBLISH_RTMPS_ENABLED=${LETSENCRYPT_EMAIL:+true}
 PUBLISH_RTMPS_PORT=1936
@@ -324,10 +489,11 @@ EOF
   KEEP THIS FILE PRIVATE. chmod 600.
 
   === OBS PUBLISHER ===
-  OBS auth uses txSecret/txTime signed URLs.
-  Backend calls POST /sign/publish to mint an RTMP URL per publish session:
-    rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive/<studio>?txSecret=<md5>&txTime=<hex>
-  SRS on_publish recomputes md5(PUBLISH_SIGN_KEY + studio + txTime) to validate.
+  OBS auth uses txSecret/txTime signed URLs scoped to a tenant.
+  Backend calls POST /sign/publish (with the tenant's bearer) to mint:
+    rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive/<tenant>__<studio>?txSecret=<md5>&txTime=<hex>
+  SRS on_publish splits "<tenant>__<studio>", looks up that tenant's
+  PUBLISH_SIGN_KEY_<TENANT>, then recomputes md5(key + stream + txTime).
 
   RTMPS fallback:  rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/luckylive
   RTMP  fallback:  rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive
@@ -335,8 +501,16 @@ EOF
   === BACKEND → AUTH API ===
   Publish sign:    POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign/publish
                    body: {"studio":"<studio>","expires_in":2592000}
-  Authorization header: Bearer $SIGN_API_TOKEN
-  Publish sign key (MD5 input):  $PUBLISH_SIGN_KEY
+                   header: Authorization: Bearer <SIGN_API_TOKEN_OF_THAT_TENANT>
+  The auth service prepends the bearer's tenant id; clients cannot spoof
+  another tenant's prefix even if they know the format.
+
+  Bootstrap tenant ("default") credentials:
+    SIGN_API_TOKEN_DEFAULT   = $DEFAULT_TENANT_TOKEN
+    PUBLISH_SIGN_KEY_DEFAULT = $DEFAULT_TENANT_KEY
+
+  Add tenants by appending more SIGN_API_TOKEN_<NAME> + PUBLISH_SIGN_KEY_<NAME>
+  pairs to /opt/streaming-auth/.env then 'systemctl restart streaming-auth'.
 
   Playback signing was removed — each client holds its own BunnyCDN pull
   zone + Authentication Key and signs URLs locally. Reference algorithm:
@@ -348,7 +522,7 @@ EOF
   (Set the same values on the SRS box; used by on the srs role below.)
 
   === NEXT STEPS ===
-  1) Create one BunnyCDN pull zone per client. Origin URL:
+  1) Create one BunnyCDN pull zone per tenant. Origin URL:
        https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}
   2) Enable Token Authentication on each pull zone and hand the
      Authentication Key + pull-zone hostname to that tenant.
@@ -419,9 +593,39 @@ UNIT_EOF
     systemctl is-active --quiet streaming-auth || err "Auth service failed; journalctl -u streaming-auth"
     ok "Auth service running as streaming-auth user"
 
+    #─── BunnyCDN edge IP refresher (script + cron + seed) ────────────────────
+    install_bunny_edge_refresher
+
     #─── HAProxy config ────────────────────────────────────────────────────────
     log "Configuring HAProxy..."
     [ ! -f /etc/haproxy/haproxy.cfg.bak ] && cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak
+
+    # Bunny edge ACL snippet, injected into HTTP/HTTPS frontends below.
+    # Bypasses control-plane paths (health probe, /sign/publish, CORS preflight)
+    # via inline anonymous ACLs so it doesn't depend on definition order.
+    local BUNNY_GUARD_DEFS=""
+    case "$BUNNY_EDGE_GUARD" in
+        off)
+            BUNNY_GUARD_DEFS=""
+            ;;
+        monitor)
+            BUNNY_GUARD_DEFS="
+    # BunnyCDN edge IP allowlist (monitor mode — log non-Bunny hits at alert
+    # level, do NOT deny). Refreshed hourly by ${BUNNY_EDGES_REFRESHER}.
+    # Grep with: journalctl -u haproxy | grep alert
+    acl is_bunny_edge src -f ${BUNNY_EDGES_LIST}
+    http-request set-log-level alert if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge
+"
+            ;;
+        enforce)
+            BUNNY_GUARD_DEFS="
+    # BunnyCDN edge IP allowlist (enforce mode — non-Bunny IPs get 403).
+    # Refreshed hourly by ${BUNNY_EDGES_REFRESHER}.
+    acl is_bunny_edge src -f ${BUNNY_EDGES_LIST}
+    http-request deny deny_status 403 if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge
+"
+            ;;
+    esac
 
     # TLS-related blocks only emitted when TLS is enabled
     local TLS_FRONTEND_HTTP=""
@@ -450,7 +654,7 @@ frontend https_in
     stick-table type ip size 100k expire 60s store http_req_rate(10s)
     http-request track-sc0 src if { path_beg /sign }
     http-request deny deny_status 429 if { path_beg /sign } { sc0_http_req_rate gt 60 }
-
+${BUNNY_GUARD_DEFS}
     acl is_auth_api path_beg /sign
     use_backend auth_service if is_auth_api
     default_backend srs_origin
@@ -528,7 +732,7 @@ frontend http_in
     stick-table type ip size 100k expire 60s store http_req_rate(10s)
     http-request track-sc0 src if { path_beg /sign }
     http-request deny deny_status 429 if { path_beg /sign } { sc0_http_req_rate gt 60 }
-
+${BUNNY_GUARD_DEFS}
     acl is_auth_api path_beg /sign
     use_backend auth_service if is_auth_api
     default_backend srs_origin
@@ -683,9 +887,20 @@ SYSCTL_EOF
     echo "    haproxy:        $(systemctl is-active haproxy)"
     echo "    streaming-auth: $(systemctl is-active streaming-auth) (user: streaming-auth)"
     echo ""
+    local edge_count="(none)"
+    [ -s "$BUNNY_EDGES_LIST" ] && edge_count="$(wc -l < "$BUNNY_EDGES_LIST" | tr -d ' ') IPs"
+    echo "  Bunny edge guard: $BUNNY_EDGE_GUARD ($edge_count, refreshed hourly via cron)"
+    echo "                    list:    $BUNNY_EDGES_LIST"
+    echo "                    script:  $BUNNY_EDGES_REFRESHER"
+    echo "                    cron:    /etc/cron.d/bunny-edges"
+    if [ "$BUNNY_EDGE_GUARD" = "off" ]; then
+        echo "                    flip on with: BUNNY_EDGE_GUARD=monitor bash $0 haproxy"
+    fi
+    echo ""
     echo "  Credentials:      /root/STREAM_KEYS.txt (chmod 600)"
     echo "  Logs:             journalctl -u streaming-auth -f"
     echo "                    journalctl -u haproxy -f"
+    echo "                    journalctl -t bunny-edges -f"
     echo ""
     echo "  Next steps:"
     echo "    1) Run on SRS box:  SRS_API_USER=admin SRS_API_PASS=<from STREAM_KEYS.txt> bash $0 srs"

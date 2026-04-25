@@ -57,9 +57,11 @@ streaming-auth/
 │   ├── common/                  # ApiTokenGuard, ZodValidationPipe, filters
 │   └── modules/
 │       ├── health/              # GET  /health
+│       ├── tenants/             # boot-time tenant registry (env-driven)
+│       │   └── tenants.service.ts             # SIGN_API_TOKEN_<T> + PUBLISH_SIGN_KEY_<T> loader
 │       ├── streams/             # POST /srs/publish, /srs/unpublish (VPC-only)
-│       │   ├── push-key.resolver.ts           # publish-key indirection (per-client ready)
-│       │   └── env-push-key.resolver.ts       # single PUBLISH_SIGN_KEY impl
+│       │   ├── push-key.resolver.ts           # publish-key indirection abstraction
+│       │   └── env-push-key.resolver.ts       # tenant-scoped impl (parses <tenant>__<studio>)
 │       └── sign/                # POST /sign/publish (Bearer guard + rate limited)
 │           ├── bigsur-publish.service.ts   # txSecret/txTime publish URL minter (wired)
 │           ├── bunny.service.ts            # md5 token minting — REFERENCE ONLY (clients sign locally)
@@ -204,21 +206,56 @@ Backend calls `https://api.example.com/sign/publish` — no cert pinning needed,
 
 ---
 
+## Multi-tenant model
+
+The auth service is multi-tenant. Each tenant has:
+- A short, lowercase **tenant id** (`^[a-z0-9]{2,16}$`) — appears in stream names and BunnyCDN paths.
+- A **bearer token** (`SIGN_API_TOKEN_<TENANT_UC>`) used to call `/sign/publish`.
+- A **push signing key** (`PUBLISH_SIGN_KEY_<TENANT_UC>`) — md5 input for the OBS RTMP token.
+- A **BunnyCDN pull zone + Authentication Key** held client-side (signs playback URLs locally).
+
+Stream names always have the form `<tenant>__<studio>` (double underscore separator):
+
+```
+rtmp://bspush.example.com/luckylive/<tenant>__<studio>?txSecret=...&txTime=...
+https://<tenant-pullzone>.b-cdn.net/luckylive/<tenant>__<studio>.m3u8?token=...
+```
+
+The auth service prepends the bearer's tenant id at sign time — callers cannot spoof another tenant's prefix even if they know the format. SRS's `on_publish` hook splits `<tenant>__<studio>`, looks up that tenant's push key via `PushKeyResolver` → `TenantsService`, and rejects mismatched / cross-tenant signatures.
+
+**Adding a tenant** (no code change):
+
+```bash
+# /opt/streaming-auth/.env
+SIGN_API_TOKEN_ACME=$(openssl rand -hex 32)
+PUBLISH_SIGN_KEY_ACME=$(openssl rand -hex 32)
+# (then create one BunnyCDN pull zone and hand the auth key to the tenant)
+
+systemctl restart streaming-auth
+```
+
+Boot fails fast (with an itemized error) if a tenant has only one of the two env vars set, if any tenant id fails the regex, or if two tenants share a bearer.
+
+**Removing / rotating a tenant**: delete (or replace) the `_ACME` pair → restart. Only that tenant's outstanding URLs are invalidated; other tenants are unaffected.
+
+---
+
 ## Publish & Play
 
 **OBS (RTMPS if `LETSENCRYPT_EMAIL` was set, else plain RTMP):**
 
-Backend mints a signed URL per publish session via `POST /sign/publish`:
+Backend mints a signed URL per publish session via `POST /sign/publish` using **that tenant's** bearer:
 
 ```bash
 curl -X POST https://api.example.com/sign/publish \
-  -H "Authorization: Bearer <SIGN_API_TOKEN>" \
+  -H "Authorization: Bearer $SIGN_API_TOKEN_ACME" \
   -H "Content-Type: application/json" \
   -d '{"studio":"LR-MNC3HOF8-5A9F04","expires_in":2592000}'
 # → {
-#     "url":       "rtmp://bspush.example.com/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
-#     "url_rtmps": "rtmps://bspush.example.com:1936/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
-#     "stream": "...", "txTime": "...", "txSecret": "...", "expires": ..., "expires_at": "..."
+#     "url":       "rtmp://bspush.example.com/luckylive/acme__LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
+#     "url_rtmps": "rtmps://bspush.example.com:1936/luckylive/acme__LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
+#     "stream": "acme__LR-MNC3HOF8-5A9F04",
+#     "txTime": "...", "txSecret": "...", "expires": ..., "expires_at": "..."
 #   }
 ```
 
@@ -226,13 +263,13 @@ curl -X POST https://api.example.com/sign/publish \
 
 Split the returned URL at the last `/` in OBS:
 - **Server**: `rtmp://$PUBLISH_HOST/luckylive` (or `rtmps://$PUBLISH_HOST:1936/luckylive`)
-- **Stream key**: `<studio>?txSecret=<md5>&txTime=<hex>`
+- **Stream key**: `<tenant>__<studio>?txSecret=<md5>&txTime=<hex>`
 
-SRS's `on_publish` hook recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` via
+SRS's `on_publish` hook recomputes `md5(PUBLISH_SIGN_KEY_<TENANT> + <tenant>__<studio> + txTime)` via
 `streaming-auth/src/modules/streams/streams.service.ts` and rejects expired /
-mismatched signatures. Today a single `PUBLISH_SIGN_KEY` signs all studios;
-`PushKeyResolver` (`streaming-auth/src/modules/streams/push-key.resolver.ts`)
-is the indirection point for future per-client keys.
+mismatched / cross-tenant signatures. The lookup is per-tenant via
+`PushKeyResolver` (`streaming-auth/src/modules/streams/env-push-key.resolver.ts`)
+→ `TenantsService` (`streaming-auth/src/modules/tenants/tenants.service.ts`).
 
 #### Recommended OBS encoder settings
 
@@ -269,20 +306,23 @@ LL-HLS segment boundary; anything else degrades latency and segment alignment.
 
 For adaptive bitrate (viewer auto-switches quality) without paying for SRS-side
 transcoding, run multiple OBS instances (or one OBS with multi-output plugin)
-publishing the same content under different studio codes — e.g. `LR-XXX-high`,
-`LR-XXX-mid`, `LR-XXX-low` — then assemble a master `.m3u8` referencing the
-three rendition manifests.
+publishing the same content under different studio codes — e.g.
+`acme__LR-XXX-high`, `acme__LR-XXX-mid`, `acme__LR-XXX-low` — then assemble a
+master `.m3u8` referencing the three rendition manifests.
 
-**Viewer (client-signed):** the client mints the BunnyCDN URL locally with its own `BUNNY_TOKEN_KEY`. Reference algorithm in `streaming-auth/src/modules/sign/bunny.service.ts`. Pseudocode:
+**Viewer (client-signed):** the tenant mints the BunnyCDN URL locally with its own `BUNNY_TOKEN_KEY` (the Authentication Key from its pull zone). Reference algorithm in `streaming-auth/src/modules/sign/bunny.service.ts`. Pseudocode:
 
 ```
-expires = floor(now/1000) + ttl
-hashInput = BUNNY_TOKEN_KEY + "/live/" + expires        # + viewer_ip if pinning
-token    = base64url(md5_bytes(hashInput))              # raw md5, not hex
-url      = `https://<pullzone>.b-cdn.net/live/<stream>.m3u8?token=${token}&token_path=%2Flive%2F&expires=${expires}`
+stream     = `<tenant>__<studio>`
+basePath   = `/luckylive/`
+expires    = floor(now/1000) + ttl
+hashInput  = BUNNY_TOKEN_KEY + basePath + expires       # + viewer_ip if pinning
+token      = base64url(md5_bytes(hashInput))            # raw md5, not hex
+url        = `https://<tenant-pullzone>.b-cdn.net${basePath}${stream}.m3u8`
+           + `?token=${token}&token_path=${encodeURIComponent(basePath)}&expires=${expires}`
 ```
 
-Feed that URL to hls.js / native `<video>`.
+`token_path = /luckylive/` covers both the `.m3u8` manifest and every `.ts` / `.m4s` segment under that prefix with a single token. Feed the resulting URL to hls.js / native `<video>`.
 
 ---
 
@@ -347,17 +387,20 @@ Env knobs that override YAML:
 | `PUBLISH_DOMAIN` / `PUBLISH_APP` | `publish.pushDomain` / `publish.app` |
 | `PUBLISH_RTMPS_ENABLED` / `PUBLISH_RTMPS_PORT` | `publish.rtmpsEnabled` / `publish.rtmpsPort` |
 
-**Env-only (secrets — never in YAML):**
-- `SIGN_API_TOKEN` — required, ≥16 chars. Bearer for `/sign/publish`.
-- `PUBLISH_SIGN_KEY` — required for `/sign/publish` + `/srs/publish` to succeed (else 503/deny). Signs all studios today; one key per client in the planned per-client model.
-- `BUNNY_TOKEN_KEY` — **no longer required server-side**. Now held per-tenant by clients, who sign playback URLs locally. The reference signer (`bunny.service.ts`) still reads it if you want to sanity-check the algorithm during development.
+**Per-tenant secrets (env-only):**
+- `SIGN_API_TOKEN_<TENANT>` — ≥16 chars. Bearer for `/sign/publish`. One per tenant; the bearer determines which tenant prefix the auth service prepends.
+- `PUBLISH_SIGN_KEY_<TENANT>` — ≥8 chars. md5 input for that tenant's RTMP token. SRS `on_publish` looks this up via `<tenant>__<studio>` → tenant.
+- `<TENANT>` is uppercase of the tenant id (lowercase `[a-z0-9]{2,16}`). Both vars must be present for a tenant to be active; mismatched pairs fail boot with an itemized error.
+
+**Other env-only secrets:**
+- `BUNNY_TOKEN_KEY` — **no longer required server-side**. Held per-tenant by clients, who sign playback URLs locally. The reference signer (`bunny.service.ts`) still reads it if you want to sanity-check the algorithm during development.
 
 ### Extending the service
 
 - **Add an endpoint**: new module under `src/modules/` → import in `app.module.ts`.
-- **Per-client push keys**: implement `PushKeyResolver.resolve(stream)` to look up `stream → client → pushKey` (e.g. `ClientPushKeyResolver`) and swap the provider in `streams.module.ts`. Minter (`bigsur-publish.service.ts`) and validator (`streams.service.ts`) both read through the resolver — no other changes needed. A leaked key then only invalidates the studios owned by that client.
+- **Custom push-key store**: replace `EnvPushKeyResolver` (env-driven) with a different `PushKeyResolver` impl (e.g. database-backed) and swap the provider in `streams.module.ts`. Minter (`bigsur-publish.service.ts`) and validator (`streams.service.ts`) both go through the resolver — no other changes needed.
 - **Validation**: write zod schemas in `dto/`, apply via `ZodValidationPipe`.
-- **Auth another route**: `@UseGuards(ApiTokenGuard)` on the controller/handler.
+- **Auth another route**: `@UseGuards(ApiTokenGuard)` on the controller/handler. The guard attaches `req.tenant` for downstream handlers.
 
 ---
 
@@ -366,9 +409,9 @@ Env knobs that override YAML:
 - TLS 1.2+ only, HSTS, modern cipher suite
 - Non-root service users (`streaming-auth`, `srs`)
 - Systemd sandboxing: `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, namespace restriction (`MemoryDenyWriteExecute` omitted — incompatible with V8 JIT)
-- Bearer token on `/sign/publish`; constant-time compare; per-IP rate limit (120/min app + 60/10s HAProxy)
-- Config validated by zod on boot — service fails to start on bad/missing config
-- Stream name allowlist: `^[a-zA-Z0-9_-]{1,64}$` (enforced in SRS hooks and `/sign/publish` DTO)
+- Per-tenant bearer on `/sign/publish`; constant-time compare across all configured tenants; per-IP rate limit (120/min app + 60/10s HAProxy)
+- Config validated by zod on boot, plus tenant pairing validated by `TenantsService` — service fails to start on bad/missing/mismatched secrets
+- Stream name allowlist: `^[a-z0-9]{2,16}__[a-zA-Z0-9_-]{1,48}$` (enforced in SRS hooks); `/sign/publish` rejects any `studio` containing the `__` separator so callers cannot inject a foreign tenant prefix
 - Pino structured JSON logs with auth/cookie headers redacted
 - SRS HTTP API behind basic auth; bound to VPC IP (not public)
 - SRS pinned to `v6.0-r0` (not `develop`)
@@ -392,6 +435,71 @@ Env knobs that override YAML:
 - HAProxy `:3000` — `/srs/publish`, `/srs/unpublish`, `/health`
 - SRS `:1935` RTMP, `:8080` HTTP/HLS, `:1985` API (basic auth)
 - HAProxy stats on `127.0.0.1:8404`
+
+---
+
+## Protecting the origin (`$HAPROXY_PUBLIC_IP` + grey-cloud DNS)
+
+Today the HAProxy edge IP and `$PUBLISH_HOST` / `$PLAYBACK_ORIGIN_HOST` hostnames are public. Three things absorb most of the realistic threat surface; ship in this order.
+
+**1. Lock HLS pull to BunnyCDN edge IPs.** (Built into `setup-streaming-infra.sh`.)
+Bunny publishes its edge list (https://api.bunny.net/system/edgeserverlist + IPv6 variant). Without this, anyone who learns a tenant's `<tenant>__<studio>` can hit `https://$HAPROXY_PUBLIC_IP/luckylive/<tenant>__<studio>.m3u8` directly and bypass BunnyCDN Token Auth entirely.
+
+The setup script always installs:
+- `/usr/local/sbin/refresh-bunny-edges.sh` — fetches both edge lists, validates (≥30 IPs sanity floor, regex line check), atomically replaces `/etc/haproxy/lists/bunny-edges.lst`, reloads HAProxy on diff.
+- `/etc/cron.d/bunny-edges` — runs the refresher hourly + at boot.
+- Logs land under `journalctl -t bunny-edges`.
+
+The HAProxy ACL itself is gated by `BUNNY_EDGE_GUARD`:
+
+```bash
+# Option A: ship without enforcement (script + cron still installed; status quo)
+bash setup-streaming-infra.sh haproxy   # default BUNNY_EDGE_GUARD=off
+
+# Option B: monitor mode — non-Bunny hits log at alert level, no deny.
+#  Soak for a week, grep `journalctl -u haproxy | grep alert`, then flip.
+BUNNY_EDGE_GUARD=monitor bash setup-streaming-infra.sh haproxy
+
+# Option C: enforce mode — non-Bunny IPs get 403.
+#  Pre-flight refuses if the seed list is empty / has <30 IPs.
+BUNNY_EDGE_GUARD=enforce bash setup-streaming-infra.sh haproxy
+```
+
+The ACL bypass list (`/health`, `/sign/*`, OPTIONS preflights) is hard-coded so the guard never gates the control plane — only HLS pull traffic.
+
+**2. Allowlist your backend on `/sign/publish`.**
+Bearer leaks happen — make IP allowlist the actual gate, bearer the secondary. HAProxy ACL `src -f /etc/haproxy/backend-allowlist.lst` on `/sign/publish` paths. If your backend is behind Cloudflare, allowlist the CF IP ranges instead.
+
+**3. Lock RTMP / RTMPS to publisher IPs.**
+`$PUBLISH_HOST` resolves to the same public IP as the playback origin and accepts unauthenticated TCP connects on `:1935` / `:1936` (the txSecret check happens after the handshake — the connect itself is free for an attacker). Two options:
+- **Static publisher IPs** (studios on fixed business connections): UFW + HAProxy ACL allow only those `/32`s on `:1935` / `:1936`.
+- **Dynamic publishers**: put publishers on a VPN / WireGuard hop and accept RTMP only from the VPN subnet. Slightly more friction, much smaller surface.
+
+**4. Per-IP connection + request caps in HAProxy** (defense-in-depth, even after IP allowlists):
+
+```haproxy
+stick-table type ip size 1m expire 60s store conn_rate(10s),http_req_rate(10s)
+http-request track-sc0 src
+http-request deny deny_status 429 if { sc0_conn_rate gt 50 }
+http-request deny deny_status 429 if { sc0_http_req_rate gt 200 }
+tcp-request connection reject if { src_conn_rate gt 100 }
+```
+
+These already exist for `path_beg /sign` from the original setup; extend them globally so `/luckylive/*` is also covered before the Bunny ACL kicks in.
+
+**5. Rotate the public RTMP hostname once publishers are stable.**
+After the publisher allowlist lands you can drop public DNS for `$PUBLISH_HOST` entirely — publishers connect via a WireGuard endpoint or by raw IP, and the public RTMP surface goes away.
+
+**6. Optional: front `/sign/publish` with Cloudflare orange-cloud.**
+`api.example.com` is already proxied. CF absorbs L7 floods on the publish-sign endpoint without changing anything server-side. Don't proxy the playback origin through CF — BunnyCDN pulling through CF stacks two CDNs and CF will rate-limit the pull.
+
+**What the per-tenant model already buys you:**
+- A leaked `SIGN_API_TOKEN_<TENANT>` only mints URLs for that tenant (the bearer-to-tenant binding lives server-side; clients can't override).
+- A leaked `PUBLISH_SIGN_KEY_<TENANT>` only forges OBS push tokens for that tenant.
+- A leaked BunnyCDN `BUNNY_TOKEN_KEY` only signs playback for that tenant's pull zone.
+- Cross-tenant key swap is rejected at SRS `on_publish` (covered by the e2e suite).
+
+Tenant prefix in the URL path is **not** a security control — it's a routing/isolation key. The four mechanisms above are the actual fence.
 
 ---
 
