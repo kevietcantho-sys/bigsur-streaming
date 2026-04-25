@@ -1,5 +1,14 @@
 import { z } from 'zod';
 
+// Env vars arrive as strings — coerce common truthy/falsy literals.
+// `z.coerce.boolean()` is a footgun (any non-empty string → true).
+const envBoolSchema = z
+  .union([z.boolean(), z.string()])
+  .transform((v) => {
+    if (typeof v === 'boolean') return v;
+    return /^(1|true|yes|on)$/i.test(v.trim());
+  });
+
 const byteSizeSchema = z
   .string()
   .regex(/^\d+(b|kb|mb)$/i, 'bodyLimit must look like "16kb"');
@@ -43,15 +52,19 @@ export const configSchema = z.object({
     tokenKey: z.string(),     // may be empty → /sign fails closed (503)
   }),
 
-  // Publish-URL signing (TencentCloud CSS style: ?txSecret=<md5>&txTime=<hex>)
+  // Publish-URL signing (txSecret/txTime).
   // `/sign/publish` fails closed (503) when pushDomain or signKey are empty.
+  // rtmpsEnabled gates the optional `url_rtmps` field — only flip on when
+  // a Let's Encrypt cert is bound to :rtmpsPort (else OBS rejects the cert).
   publish: z.object({
-    pushDomain: z.string(),   // e.g. bspush.trangchudangnhap.net
-    app: z.string().min(1),   // RTMP app component (e.g. "luckylive")
-    signKey: z.string(),      // secret, env-only
+    pushDomain: z.string(),
+    app: z.string().min(1),
+    signKey: z.string(),
     minExpires: z.coerce.number().int().positive(),
     maxExpires: z.coerce.number().int().positive(),
     defaultExpires: z.coerce.number().int().positive(),
+    rtmpsEnabled: envBoolSchema.default(false),
+    rtmpsPort: z.coerce.number().int().min(1).max(65535).default(1936),
   }).refine(
     (v) => v.minExpires <= v.defaultExpires && v.defaultExpires <= v.maxExpires,
     { message: 'publish expires bounds must satisfy min <= default <= max' },

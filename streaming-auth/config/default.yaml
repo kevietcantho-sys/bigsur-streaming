@@ -50,6 +50,12 @@ publish:
   minExpires: 300          # 5 min
   maxExpires: 31536000     # 12 months
   defaultExpires: 2592000  # 30 days
+
+  # Emit `url_rtmps` in /sign/publish responses. Only flip to true after
+  # a Let's Encrypt cert is bound on rtmpsPort — the CF Origin Cert is
+  # rejected by OBS. Env: PUBLISH_RTMPS_ENABLED.
+  rtmpsEnabled: false
+  rtmpsPort: 1936
   # signKey is a secret — set via env PUBLISH_SIGN_KEY only
 
 origin:

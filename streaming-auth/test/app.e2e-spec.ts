@@ -175,7 +175,7 @@ describe('streaming-auth (e2e)', () => {
       expect(r.status).toBe(400);
     });
 
-    it('200 mints a TencentCloud-style publish URL', async () => {
+    it('200 mints a publish URL', async () => {
       const r = await request(app.getHttpServer())
         .post('/sign/publish')
         .set('Authorization', `Bearer ${API_TOKEN}`)
@@ -190,6 +190,15 @@ describe('streaming-auth (e2e)', () => {
       expect(parseInt(r.body.txTime, 16)).toBe(r.body.expires);
     });
 
+    it('omits url_rtmps when PUBLISH_RTMPS_ENABLED is unset', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/sign/publish')
+        .set('Authorization', `Bearer ${API_TOKEN}`)
+        .send({ studio: 'studio1', expires_in: 3600 });
+      expect(r.status).toBe(200);
+      expect(r.body.url_rtmps).toBeUndefined();
+    });
+
     it('signature matches md5(signKey + stream + txTime)', async () => {
       const r = await request(app.getHttpServer())
         .post('/sign/publish')
@@ -201,6 +210,45 @@ describe('streaming-auth (e2e)', () => {
         .digest('hex');
       expect(r.body.txSecret).toBe(expected);
     });
+  });
+});
+
+describe('streaming-auth — RTMPS enabled', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    setEnv({
+      NODE_ENV: 'test',
+      SIGN_API_TOKEN: API_TOKEN,
+      BUNNY_TOKEN_KEY: 'bunny-secret',
+      BUNNY_CDN_URL: 'https://stream.b-cdn.net',
+      PUBLISH_DOMAIN: 'bspush.example.com',
+      PUBLISH_APP: 'luckylive',
+      PUBLISH_SIGN_KEY,
+      PUBLISH_RTMPS_ENABLED: 'true',
+      PUBLISH_RTMPS_PORT: '1936',
+      LOG_LEVEL: 'error',
+      SIGN_RATE_TTL: '60000',
+      SIGN_RATE_LIMIT: '10000',
+    });
+    const mod: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = mod.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => { await app.close(); });
+
+  it('emits both url and url_rtmps with matching signature', async () => {
+    const r = await request(app.getHttpServer())
+      .post('/sign/publish')
+      .set('Authorization', `Bearer ${API_TOKEN}`)
+      .send({ studio: 'LR-RTMPS-001', expires_in: 3600 });
+    expect(r.status).toBe(200);
+    const query = `?txSecret=${r.body.txSecret}&txTime=${r.body.txTime}`;
+    expect(r.body.url).toBe(`rtmp://bspush.example.com/luckylive/LR-RTMPS-001${query}`);
+    expect(r.body.url_rtmps).toBe(`rtmps://bspush.example.com:1936/luckylive/LR-RTMPS-001${query}`);
   });
 });
 

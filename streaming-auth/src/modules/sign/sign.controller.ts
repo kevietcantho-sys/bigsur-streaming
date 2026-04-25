@@ -17,14 +17,14 @@ import {
   signRequestSchema,
 } from './dto/sign-request.dto';
 import { SignService } from './sign.service';
-import { TencentPublishService } from './tencent-publish.service';
+import { BigsurPublishService } from './bigsur-publish.service';
 
 @Controller('sign')
 @UseGuards(ApiTokenGuard)
 export class SignController {
   constructor(
     private readonly signService: SignService,
-    private readonly publishSigner: TencentPublishService,
+    private readonly publishSigner: BigsurPublishService,
   ) {}
 
   /** Playback URL signer — BunnyCDN token-authenticated HLS manifest. */
@@ -35,7 +35,7 @@ export class SignController {
     return this.signService.sign(dto);
   }
 
-  /** Publish URL signer — TencentCloud-CSS-style RTMP push URL for OBS. */
+  /** Publish URL signer — txSecret/txTime RTMP(S) push URL for OBS. */
   @Post('publish')
   @HttpCode(200)
   @UsePipes(new ZodValidationPipe(publishSignRequestSchema))

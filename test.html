@@ -261,6 +261,21 @@
         const v = document.getElementById('video');
         
         if (Hls.isSupported()) {
+          // BunnyCDN Token Auth requires the token query on EVERY request
+          // (manifest + each segment). hls.js drops the manifest's query
+          // string when resolving relative segment URIs (RFC 3986), so we
+          // re-append it via a Loader subclass that mutates context.url
+          // before the request fires. Belt-and-suspenders xhrSetup below
+          // covers the legacy XHR path; the loader covers fetch-streaming.
+          const TokenLoader = class extends Hls.DefaultConfig.loader {
+            load(context, config, callbacks) {
+              if (signedQuery && context.url.indexOf('token=') === -1) {
+                context.url += signedQuery;
+              }
+              super.load(context, config, callbacks);
+            }
+          };
+
           hls = new Hls({
             lowLatencyMode: cfg.lowLatencyMode,
             liveSyncDurationCount: cfg.liveSyncDurationCount,
@@ -276,12 +291,13 @@
             highBufferWatchdogPeriod: 3,
             nudgeOffset: 0.2,
             nudgeMaxRetry: 5,
-            
-            // Append BunnyCDN token params to every request
+
+            loader: TokenLoader,
+
+            // Fallback for any code path that still uses XHR directly
             xhrSetup: function(xhr, url) {
-              if (url.indexOf('token=') === -1 && signedQuery) {
-                const newUrl = url + signedQuery;
-                xhr.open('GET', newUrl, true);
+              if (signedQuery && url.indexOf('token=') === -1) {
+                xhr.open('GET', url + signedQuery, true);
               }
             }
           });

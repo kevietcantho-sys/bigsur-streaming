@@ -1,6 +1,6 @@
 /**
  * Push-key lookup abstraction — the secret used to mint / validate
- * TencentCloud-CSS-style `?txSecret=<md5>&txTime=<hex>` publish URLs.
+ * `?txSecret=<md5>&txTime=<hex>` publish URLs.
  *
  * Current impl returns the single PUBLISH_SIGN_KEY for all streams
  * (one global push key). Future impl will map stream → client → key

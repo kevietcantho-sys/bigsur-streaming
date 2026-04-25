@@ -29,7 +29,7 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
 - **Sign API**: Backend calls `https://api.example.com/sign` (orange-cloud) — Cloudflare terminates public TLS with its Universal SSL cert, then re-encrypts to HAProxy using the Cloudflare Origin Cert.
 - **Viewer playback**: BunnyCDN edge serves the HLS manifest + segments to viewers via the signed URL returned by `/sign`.
 - **Auth**:
-  - Publishers: backend calls `POST /sign/publish` (Bearer) → returns TencentCloud-CSS-style `rtmp://.../<studio>?txSecret=<md5>&txTime=<hex>`. SRS `on_publish` hits `streaming-auth /srs/publish` which recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` and rejects expired / mismatched signatures.
+  - Publishers: backend calls `POST /sign/publish` (Bearer) → returns `rtmp://.../<studio>?txSecret=<md5>&txTime=<hex>` (and `rtmps://...` when `PUBLISH_RTMPS_ENABLED=true`). SRS `on_publish` hits `streaming-auth /srs/publish` which recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` and rejects expired / mismatched signatures.
   - Viewers: backend calls `POST /sign` (Bearer) → returns BunnyCDN signed URL.
 
 ---
@@ -61,7 +61,7 @@ streaming-auth/
 │       │   └── env-push-key.resolver.ts       # single PUBLISH_SIGN_KEY impl
 │       └── sign/                # POST /sign, POST /sign/publish (Bearer guard + rate limited)
 │           ├── bunny.service.ts            # md5 token minting (BunnyCDN spec)
-│           ├── tencent-publish.service.ts  # TencentCloud-CSS-style publish URL minter
+│           ├── bigsur-publish.service.ts   # txSecret/txTime publish URL minter
 │           └── dto/                        # zod request schemas
 └── test/app.e2e-spec.ts         # supertest coverage for all 5 routes
 ```
@@ -216,9 +216,15 @@ Backend mints a signed URL per publish session via `POST /sign/publish`:
 curl -X POST https://api.example.com/sign/publish \
   -H "Authorization: Bearer <SIGN_API_TOKEN>" \
   -H "Content-Type: application/json" \
-  -d '{"studio":"LR-MNC3HOF8-5A9F04","expires_in":3600}'
-# → { "url": "rtmp://bspush.example.com/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>", ... }
+  -d '{"studio":"LR-MNC3HOF8-5A9F04","expires_in":2592000}'
+# → {
+#     "url":       "rtmp://bspush.example.com/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
+#     "url_rtmps": "rtmps://bspush.example.com:1936/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>",
+#     "stream": "...", "txTime": "...", "txSecret": "...", "expires": ..., "expires_at": "..."
+#   }
 ```
+
+`url_rtmps` is only present when `PUBLISH_RTMPS_ENABLED=true` (set by `setup-streaming-infra.sh` automatically when `LETSENCRYPT_EMAIL` was provided). Without an LE cert on `:1936`, OBS rejects the handshake — keep the flag off and stick to plain RTMP.
 
 Split the returned URL at the last `/` in OBS:
 - **Server**: `rtmp://$PUBLISH_HOST/luckylive` (or `rtmps://$PUBLISH_HOST:1936/luckylive`)
@@ -229,6 +235,45 @@ SRS's `on_publish` hook recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` via
 mismatched signatures. Today a single `PUBLISH_SIGN_KEY` signs all studios;
 `PushKeyResolver` (`streaming-auth/src/modules/streams/push-key.resolver.ts`)
 is the indirection point for future per-client keys.
+
+#### Recommended OBS encoder settings
+
+SRS does not transcode — whatever OBS pushes is exactly what viewers receive.
+Pick one tier per studio. Keyframe interval **must** be `2` to match the 2-second
+LL-HLS segment boundary; anything else degrades latency and segment alignment.
+
+**Common to every tier**
+
+- **Settings → Stream**
+  - Service: `Custom...`
+  - Server: `rtmp://$PUBLISH_HOST/luckylive` (or `rtmps://$PUBLISH_HOST:1936/luckylive` with LE)
+  - Stream Key: full `<studio>?txSecret=…&txTime=…` returned by `POST /sign/publish`
+- **Settings → Output → Mode: Advanced → Streaming**
+  - Encoder: `x264` (universal) or `NVENC H.264` / `Apple VT H.264` if available
+  - Rate Control: `CBR`
+  - Keyframe Interval: `2` (do not leave on "auto")
+  - CPU Usage Preset (x264): `veryfast`
+  - Profile: `main` (or `baseline` for 360p on weak devices)
+  - B-frames: `2` (or `0` on NVENC for lower latency)
+- **Settings → Output → Audio**: AAC, 128 kbps (96 kbps acceptable for 360p)
+- **Settings → Video**: Downscale Filter `Lanczos`
+
+**Per-tier values**
+
+| Tier | Output (Scaled) Resolution | FPS | Video Bitrate | Audio | Upload budget |
+|---|---|---|---|---|---|
+| 360p | `640x360` | 30 | 700 kbps | 96 kbps | ~0.8 Mbps |
+| 480p | `854x480` | 30 | 1200 kbps | 128 kbps | ~1.4 Mbps |
+| 720p | `1280x720` | 30 | 2500 kbps | 128 kbps | ~2.7 Mbps |
+| 1080p | `1920x1080` | 30 | 4500 kbps | 128 kbps | ~4.7 Mbps |
+
+> **Verify after Start Streaming**: bottom-right OBS stats — **dropped frames < 1%**. If climbing, drop bitrate by 30% or switch CPU preset to `superfast`. CBR is required for live (VBR causes spikes that break the 2s segment cadence).
+
+For adaptive bitrate (viewer auto-switches quality) without paying for SRS-side
+transcoding, run multiple OBS instances (or one OBS with multi-output plugin)
+publishing the same content under different studio codes — e.g. `LR-XXX-high`,
+`LR-XXX-mid`, `LR-XXX-low` — then assemble a master `.m3u8` referencing the
+three rendition manifests.
 
 **Viewer (via backend):**
 ```bash
@@ -325,6 +370,7 @@ Env knobs that override YAML:
 | `LOG_LEVEL` / `LOG_FORMAT` | `logger.*` |
 | `BUNNY_CDN_URL` | `bunny.cdnUrl` |
 | `PUBLISH_DOMAIN` / `PUBLISH_APP` | `publish.pushDomain` / `publish.app` |
+| `PUBLISH_RTMPS_ENABLED` / `PUBLISH_RTMPS_PORT` | `publish.rtmpsEnabled` / `publish.rtmpsPort` |
 
 **Env-only (secrets — never in YAML):**
 - `SIGN_API_TOKEN` — required, ≥16 chars. Bearer for `/sign` and `/sign/publish`.
@@ -334,7 +380,7 @@ Env knobs that override YAML:
 ### Extending the service
 
 - **Add an endpoint**: new module under `src/modules/` → import in `app.module.ts`.
-- **Per-client push keys**: implement `PushKeyResolver.resolve(stream)` to look up `stream → client → pushKey` (e.g. `ClientPushKeyResolver`) and swap the provider in `streams.module.ts`. Minter (`tencent-publish.service.ts`) and validator (`streams.service.ts`) both read through the resolver — no other changes needed. A leaked key then only invalidates the studios owned by that client.
+- **Per-client push keys**: implement `PushKeyResolver.resolve(stream)` to look up `stream → client → pushKey` (e.g. `ClientPushKeyResolver`) and swap the provider in `streams.module.ts`. Minter (`bigsur-publish.service.ts`) and validator (`streams.service.ts`) both read through the resolver — no other changes needed. A leaked key then only invalidates the studios owned by that client.
 - **Validation**: write zod schemas in `dto/`, apply via `ZodValidationPipe`.
 - **Auth another route**: `@UseGuards(ApiTokenGuard)` on the controller/handler.
 

@@ -96,6 +96,8 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
       minExpires: env.PUBLISH_MIN_EXPIRES,
       maxExpires: env.PUBLISH_MAX_EXPIRES,
       defaultExpires: env.PUBLISH_DEFAULT_EXPIRES,
+      rtmpsEnabled: env.PUBLISH_RTMPS_ENABLED,
+      rtmpsPort: env.PUBLISH_RTMPS_PORT,
     },
     origin: {
       host: env.ORIGIN_HOST,

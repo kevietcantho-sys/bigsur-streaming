@@ -284,12 +284,15 @@ SIGN_API_TOKEN=$SIGN_API_TOKEN
 BUNNY_TOKEN_KEY=
 BUNNY_CDN_URL=
 
-# Publish URL signing (TencentCloud-CSS-style txSecret)
+# Publish URL signing (txSecret/txTime)
 # Single global key today — SRS on_publish recomputes md5(key + stream + txTime).
 # /sign/publish + /srs/publish fail closed (403/503) until both are set.
 PUBLISH_DOMAIN=${PUBLISH_HOST:-}
 PUBLISH_APP=luckylive
 PUBLISH_SIGN_KEY=$PUBLISH_SIGN_KEY
+# Auto-enabled when LETSENCRYPT_EMAIL was set (LE cert bound on :1936)
+PUBLISH_RTMPS_ENABLED=${LETSENCRYPT_EMAIL:+true}
+PUBLISH_RTMPS_PORT=1936
 
 # SRS API basic auth (used by monitoring only; set on SRS box too)
 SRS_API_USER=admin
@@ -319,7 +322,7 @@ EOF
   KEEP THIS FILE PRIVATE. chmod 600.
 
   === OBS PUBLISHER ===
-  OBS auth now uses TencentCloud-CSS-style signed URLs.
+  OBS auth uses txSecret/txTime signed URLs.
   Backend calls POST /sign/publish to mint an RTMP URL per publish session:
     rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive/<studio>?txSecret=<md5>&txTime=<hex>
   SRS on_publish recomputes md5(PUBLISH_SIGN_KEY + studio + txTime) to validate.

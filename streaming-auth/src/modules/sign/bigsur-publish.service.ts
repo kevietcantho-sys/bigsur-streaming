@@ -4,26 +4,30 @@ import { AppConfigService } from '../../config/app-config.service';
 import { PushKeyResolver } from '../streams/push-key.resolver';
 
 export interface SignedPublishUrl {
-  url: string;
+  url: string;             // rtmp://… (always present)
+  url_rtmps?: string;      // rtmps://…:<port>/… (only when PUBLISH_RTMPS_ENABLED=true)
   stream: string;
-  txTime: string;        // lowercase hex of unix-seconds expiry
-  txSecret: string;      // md5(signKey + stream + txTime)
-  expires: number;       // unix seconds
-  expires_at: string;    // iso8601
+  txTime: string;          // lowercase hex of unix-seconds expiry
+  txSecret: string;        // md5(signKey + stream + txTime)
+  expires: number;         // unix seconds
+  expires_at: string;      // iso8601
 }
 
 /**
- * Mint a TencentCloud-CSS-style signed RTMP publish URL.
+ * Mint a signed RTMP push URL (txSecret/txTime scheme).
  *
  * Format: rtmp://<pushDomain>/<app>/<stream>?txSecret=<md5>&txTime=<hex>
  * Scheme: txSecret = md5(signKey + stream + txTime), txTime = hex(unix_expires).
  *
- * Tokens are stateless — SRS's on_publish hook (StreamsService.checkPublish)
- * recomputes the same md5 via PushKeyResolver to validate incoming publishes.
- * Sharing the resolver keeps minter and validator on one key source.
+ * RTMPS variant is only emitted when PUBLISH_RTMPS_ENABLED is set, since
+ * RTMPS on :1936 only works if the deploy issued a Let's Encrypt cert
+ * for $PUBLISH_HOST (the Cloudflare Origin Cert is rejected by OBS).
+ *
+ * SRS's on_publish hook (StreamsService.checkPublish) recomputes the same
+ * md5 via PushKeyResolver to validate incoming publishes.
  */
 @Injectable()
-export class TencentPublishService {
+export class BigsurPublishService {
   constructor(
     private readonly config: AppConfigService,
     private readonly pushKeys: PushKeyResolver,
@@ -45,8 +49,10 @@ export class TencentPublishService {
       });
     }
 
-    const { pushDomain, app, minExpires, maxExpires, defaultExpires } =
-      this.config.publish;
+    const {
+      pushDomain, app, minExpires, maxExpires, defaultExpires,
+      rtmpsEnabled, rtmpsPort,
+    } = this.config.publish;
 
     const ttl = Math.max(
       minExpires,
@@ -60,10 +66,15 @@ export class TencentPublishService {
       .update(signKey + stream + txTime)
       .digest('hex');
 
-    const url = `rtmp://${pushDomain}/${app}/${stream}?txSecret=${txSecret}&txTime=${txTime}`;
+    const query = `?txSecret=${txSecret}&txTime=${txTime}`;
+    const url = `rtmp://${pushDomain}/${app}/${stream}${query}`;
+    const url_rtmps = rtmpsEnabled
+      ? `rtmps://${pushDomain}:${rtmpsPort}/${app}/${stream}${query}`
+      : undefined;
 
     return {
       url,
+      ...(url_rtmps ? { url_rtmps } : {}),
       stream,
       txTime,
       txSecret,
