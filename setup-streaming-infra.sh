@@ -270,8 +270,6 @@ HOOK_EOF
         SIGN_API_TOKEN=$(openssl rand -hex 32)
         PUBLISH_SIGN_KEY=$(openssl rand -hex 32)
         SRS_API_PASS=$(openssl rand -hex 16)
-        STUDIO1_KEY=$(openssl rand -hex 12)
-        STUDIO2_KEY=$(openssl rand -hex 12)
 
         cat > "$APP_DIR/.env" <<EOF
 # ═══════════════════════════════════════════════════════════════
@@ -281,9 +279,6 @@ HOOK_EOF
 
 # Bearer token required to call POST /sign and POST /sign/publish (backend only)
 SIGN_API_TOKEN=$SIGN_API_TOKEN
-
-# Per-stream publish keys (OBS stream key: <stream>?key=<secret>)
-STREAM_KEYS=studio1:$STUDIO1_KEY,studio2:$STUDIO2_KEY
 
 # BunnyCDN — REQUIRED. /sign fails closed (503) until both are set.
 BUNNY_TOKEN_KEY=
@@ -332,16 +327,11 @@ EOF
   RTMPS fallback:  rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/luckylive
   RTMP  fallback:  rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive
 
-  (STREAM_KEYS entries below are legacy — the secret values are not used
-   for publish auth anymore. The names still act as /sign playback allowlist.)
-    studio1 ($STUDIO1_KEY)
-    studio2 ($STUDIO2_KEY)
-
   === BACKEND → AUTH API ===
   Playback sign:   POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign
-                   body: {"stream":"studio1","expires_in":600}
+                   body: {"stream":"<studio>","expires_in":600}
   Publish sign:    POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign/publish
-                   body: {"studio":"<code>","expires_in":3600}
+                   body: {"studio":"<studio>","expires_in":2592000}
   Authorization header: Bearer $SIGN_API_TOKEN
   Publish sign key (MD5 input):  $PUBLISH_SIGN_KEY
 

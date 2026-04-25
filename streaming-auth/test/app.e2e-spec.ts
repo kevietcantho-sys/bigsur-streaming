@@ -26,7 +26,6 @@ describe('streaming-auth (e2e)', () => {
     setEnv({
       NODE_ENV: 'test',
       SIGN_API_TOKEN: API_TOKEN,
-      STREAM_KEYS: 'studio1:secret1,studio2:secret2',
       BUNNY_TOKEN_KEY: 'bunny-secret',
       BUNNY_CDN_URL: 'https://stream.b-cdn.net',
       PUBLISH_DOMAIN: 'bspush.example.com',
@@ -49,10 +48,10 @@ describe('streaming-auth (e2e)', () => {
   afterAll(async () => { await app.close(); });
 
   //─── /health ───────────────────────────────────────────────────
-  it('GET /health → 200 with stream count and cdn status', async () => {
+  it('GET /health → 200 with cdn + publish status', async () => {
     const r = await request(app.getHttpServer()).get('/health');
     expect(r.status).toBe(200);
-    expect(r.body).toEqual({ status: 'ok', streams: 2, cdn: 'configured' });
+    expect(r.body).toEqual({ status: 'ok', cdn: 'configured', publish: 'configured' });
   });
 
   //─── /srs/publish ──────────────────────────────────────────────
@@ -136,21 +135,13 @@ describe('streaming-auth (e2e)', () => {
       expect(r.status).toBe(400);
     });
 
-    it('404 on unknown stream', async () => {
+    it('200 mints a signed URL for any well-formed stream name', async () => {
       const r = await request(app.getHttpServer())
         .post('/sign')
         .set('Authorization', `Bearer ${API_TOKEN}`)
-        .send({ stream: 'ghost' });
-      expect(r.status).toBe(404);
-    });
-
-    it('200 mints a signed URL', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .set('Authorization', `Bearer ${API_TOKEN}`)
-        .send({ stream: 'studio1', expires_in: 600 });
+        .send({ stream: 'LR-MODTAJC7-2979AB', expires_in: 600 });
       expect(r.status).toBe(200);
-      expect(r.body.url).toMatch(/^https:\/\/stream\.b-cdn\.net\/live\/studio1\.m3u8\?token=/);
+      expect(r.body.url).toMatch(/^https:\/\/stream\.b-cdn\.net\/live\/LR-MODTAJC7-2979AB\.m3u8\?token=/);
       expect(typeof r.body.expires).toBe('number');
       expect(typeof r.body.expires_at).toBe('string');
     });
@@ -220,7 +211,6 @@ describe('streaming-auth — CDN not configured (503)', () => {
     setEnv({
       NODE_ENV: 'test',
       SIGN_API_TOKEN: API_TOKEN,
-      STREAM_KEYS: 'studio1:secret1',
       BUNNY_TOKEN_KEY: '',
       BUNNY_CDN_URL: '',
       LOG_LEVEL: 'error',

@@ -7,7 +7,7 @@ const SIGN_KEY = 'push-secret';
 
 function buildService(signKey: string | null = SIGN_KEY) {
   const config = {
-    streams: { nameRegex: '^[a-zA-Z0-9_-]{1,64}$', keys: {} },
+    streams: { nameRegex: '^[a-zA-Z0-9_-]{1,64}$' },
   } as unknown as AppConfigService;
 
   const resolver: PushKeyResolver = {

@@ -57,8 +57,6 @@ streaming-auth/
 │   └── modules/
 │       ├── health/              # GET  /health
 │       ├── streams/             # POST /srs/publish, /srs/unpublish (VPC-only)
-│       │   ├── stream-keys.repository.ts      # playback allowlist interface (DB-ready)
-│       │   ├── env-stream-keys.repository.ts  # STREAM_KEYS env impl
 │       │   ├── push-key.resolver.ts           # publish-key indirection (per-client ready)
 │       │   └── env-push-key.resolver.ts       # single PUBLISH_SIGN_KEY impl
 │       └── sign/                # POST /sign, POST /sign/publish (Bearer guard + rate limited)
@@ -129,7 +127,7 @@ The script will:
 2. Build `/etc/haproxy/certs/origin.pem` from `$SSL_CERT_PATH` + `$SSL_KEY_PATH` (CF Origin Cert, bound on `:443`).
 3. If `$LETSENCRYPT_EMAIL` is set: issue a Let's Encrypt cert for `$PUBLISH_HOST` via HTTP-01 on port 80, build `/etc/haproxy/certs/publish.pem`, bind it on `:1936` (RTMPS), and install pre/post/deploy renewal hooks (HAProxy briefly stops for the challenge during renewal).
 4. Copy `streaming-auth/` → `/opt/streaming-auth/`, run `npm ci && npm run build && npm prune --omit=dev`.
-5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, legacy `STREAM_KEYS` allowlist, SRS API creds. `PUBLISH_DOMAIN` defaults to `$PUBLISH_HOST`, `PUBLISH_APP=luckylive`.
+5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, SRS API creds. `PUBLISH_DOMAIN` defaults to `$PUBLISH_HOST`, `PUBLISH_APP=luckylive`.
 6. Install the `streaming-auth.service` systemd unit (running `node dist/main.js`).
 7. Write HAProxy config with TLS, rate limits, CORS, and `/sign` + `/sign/publish` + SRS backend routing.
 
@@ -138,7 +136,6 @@ The script will:
 Generates credentials at `/root/STREAM_KEYS.txt` (chmod 600). Contains:
 - `SIGN_API_TOKEN` for backend → `/sign` and `/sign/publish`
 - `PUBLISH_SIGN_KEY` (md5 input for publish URL signing — keep private)
-- Legacy `STREAM_KEYS` names (`studio1`, `studio2`) used only as the `/sign` playback allowlist
 - `SRS_API_USER` / `SRS_API_PASS` — pass to SRS box below
 
 ### 2. SRS origin
@@ -286,7 +283,7 @@ Click **▶ Load**. Reload auto-plays using the saved values.
 |---|---|
 | `Sign API 401` | Wrong bearer token |
 | `Sign API 503` | `BUNNY_TOKEN_KEY` or `BUNNY_CDN_URL` not configured |
-| `Sign API 400` | Stream name not in `STREAM_KEYS` env |
+| `Sign API 400` | Stream name fails the regex (must match `^[a-zA-Z0-9_-]{1,64}$`) |
 | `FATAL: manifestLoadError` | Signed URL returned but OBS isn't publishing (HLS doesn't exist yet) |
 | Network error, no response | Sign endpoint hostname doesn't resolve, or browser rejects the TLS cert (use CF-proxied hostname) |
 | CORS error | Not expected — HAProxy config already allows `Authorization` header and `*` origin. If you see this, the request isn't hitting HAProxy. |
@@ -298,7 +295,7 @@ Click **▶ Load**. Reload auto-plays using the saved values.
 ```bash
 cd streaming-auth
 npm install
-cp .env.example .env             # fill SIGN_API_TOKEN + STREAM_KEYS + PUBLISH_* + BUNNY_*
+cp .env.example .env             # fill SIGN_API_TOKEN + PUBLISH_* + BUNNY_*
 npm run start:dev                # hot reload
 npm test                         # unit tests
 npm run test:e2e                 # e2e covering all 5 routes
@@ -331,14 +328,12 @@ Env knobs that override YAML:
 
 **Env-only (secrets — never in YAML):**
 - `SIGN_API_TOKEN` — required, ≥16 chars. Bearer for `/sign` and `/sign/publish`.
-- `STREAM_KEYS` — required, format `name1:secret1,name2:secret2`. Names act as the `/sign` playback allowlist; the `:secret` half is legacy and unused by publish auth.
 - `PUBLISH_SIGN_KEY` — required for `/sign/publish` + `/srs/publish` to succeed (else 503/deny). Signs all studios today; one key per client in the planned per-client model.
 - `BUNNY_TOKEN_KEY` — required for `/sign` to succeed (else 503).
 
 ### Extending the service
 
 - **Add an endpoint**: new module under `src/modules/` → import in `app.module.ts`.
-- **Back stream keys with a DB**: implement `StreamKeysRepository` (e.g. `PgStreamKeysRepository`), swap the provider in `streams.module.ts`. Zero controller/service changes.
 - **Per-client push keys**: implement `PushKeyResolver.resolve(stream)` to look up `stream → client → pushKey` (e.g. `ClientPushKeyResolver`) and swap the provider in `streams.module.ts`. Minter (`tencent-publish.service.ts`) and validator (`streams.service.ts`) both read through the resolver — no other changes needed. A leaked key then only invalidates the studios owned by that client.
 - **Validation**: write zod schemas in `dto/`, apply via `ZodValidationPipe`.
 - **Auth another route**: `@UseGuards(ApiTokenGuard)` on the controller/handler.
@@ -399,7 +394,7 @@ systemctl restart srs                       # on origin
 bash setup-streaming-infra.sh haproxy
 ```
 
-Rotate `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, or `STREAM_KEYS`: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`. Rotating `PUBLISH_SIGN_KEY` invalidates every live OBS URL — publishers must re-fetch from `/sign/publish`.
+Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`. Rotating `PUBLISH_SIGN_KEY` invalidates every live OBS URL — publishers must re-fetch from `/sign/publish`.
 
 ---
 

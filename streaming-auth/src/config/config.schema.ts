@@ -1,30 +1,5 @@
 import { z } from 'zod';
 
-const streamKeysSchema = z
-  .string()
-  .transform((raw, ctx) => {
-    const map: Record<string, string> = {};
-    for (const pair of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
-      const [name, secret] = pair.split(':').map((s) => s?.trim());
-      if (!name || !secret) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Invalid STREAM_KEYS entry: "${pair}" (expected name:secret)`,
-        });
-        return z.NEVER;
-      }
-      map[name] = secret;
-    }
-    if (Object.keys(map).length === 0) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: 'STREAM_KEYS must define at least one stream',
-      });
-      return z.NEVER;
-    }
-    return map;
-  });
-
 const byteSizeSchema = z
   .string()
   .regex(/^\d+(b|kb|mb)$/i, 'bodyLimit must look like "16kb"');
@@ -61,8 +36,6 @@ export const configSchema = z.object({
 
   streams: z.object({
     nameRegex: z.string().min(1),
-    // Parsed from STREAM_KEYS env
-    keys: streamKeysSchema,
   }),
 
   bunny: z.object({

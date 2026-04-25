@@ -84,7 +84,6 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
     },
     streams: {
       nameRegex: env.STREAMS_NAME_REGEX,
-      keys: env.STREAM_KEYS, // parsed by zod transform
     },
     bunny: {
       cdnUrl: env.BUNNY_CDN_URL,

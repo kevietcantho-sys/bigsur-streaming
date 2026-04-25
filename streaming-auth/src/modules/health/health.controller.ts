@@ -11,8 +11,8 @@ export class HealthController {
   health() {
     return {
       status: 'ok',
-      streams: Object.keys(this.config.streams.keys).length,
       cdn: this.config.bunnyReady ? 'configured' : 'pending',
+      publish: this.config.publishReady ? 'configured' : 'pending',
     };
   }
 }
