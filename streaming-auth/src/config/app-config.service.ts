@@ -41,8 +41,9 @@ export class AppConfigService {
     return Boolean(this.cfg.bunny.cdnUrl && this.cfg.bunny.tokenKey);
   }
 
-  /** True when publish signing is fully configured; /sign/publish returns 503 otherwise. */
+  /** True when the shared publish ingress is configured. Per-tenant push
+   *  keys are checked separately by PushKeyResolver / TenantsService. */
   get publishReady(): boolean {
-    return Boolean(this.cfg.publish.pushDomain && this.cfg.publish.signKey);
+    return Boolean(this.cfg.publish.pushDomain);
   }
 }

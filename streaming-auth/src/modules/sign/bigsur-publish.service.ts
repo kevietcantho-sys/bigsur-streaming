@@ -6,7 +6,7 @@ import { PushKeyResolver } from '../streams/push-key.resolver';
 export interface SignedPublishUrl {
   url: string;             // rtmp://… (always present)
   url_rtmps?: string;      // rtmps://…:<port>/… (only when PUBLISH_RTMPS_ENABLED=true)
-  stream: string;
+  stream: string;          // <tenant>__<studio>
   txTime: string;          // lowercase hex of unix-seconds expiry
   txSecret: string;        // md5(signKey + stream + txTime)
   expires: number;         // unix seconds
@@ -16,15 +16,12 @@ export interface SignedPublishUrl {
 /**
  * Mint a signed RTMP push URL (txSecret/txTime scheme).
  *
- * Format: rtmp://<pushDomain>/<app>/<stream>?txSecret=<md5>&txTime=<hex>
+ * Format: rtmp://<pushDomain>/<app>/<tenant>__<studio>?txSecret=<md5>&txTime=<hex>
  * Scheme: txSecret = md5(signKey + stream + txTime), txTime = hex(unix_expires).
  *
- * RTMPS variant is only emitted when PUBLISH_RTMPS_ENABLED is set, since
- * RTMPS on :1936 only works if the deploy issued a Let's Encrypt cert
- * for $PUBLISH_HOST (the Cloudflare Origin Cert is rejected by OBS).
- *
- * SRS's on_publish hook (StreamsService.checkPublish) recomputes the same
- * md5 via PushKeyResolver to validate incoming publishes.
+ * `tenant` is bound by the guard from the bearer token — callers cannot
+ * pass it directly. PushKeyResolver looks up the tenant's PUBLISH_SIGN_KEY
+ * via TenantsService; SRS's on_publish hook reuses the same resolver.
  */
 @Injectable()
 export class BigsurPublishService {
@@ -33,19 +30,20 @@ export class BigsurPublishService {
     private readonly pushKeys: PushKeyResolver,
   ) {}
 
-  async sign(studio: string, expiresIn: number): Promise<SignedPublishUrl> {
-    if (!this.config.publishReady) {
+  async sign(tenant: string, studio: string, expiresIn: number): Promise<SignedPublishUrl> {
+    if (!this.config.publish.pushDomain) {
       throw new ServiceUnavailableException({
         error: 'publish_not_configured',
-        hint: 'Set PUBLISH_DOMAIN and PUBLISH_SIGN_KEY',
+        hint: 'Set PUBLISH_DOMAIN',
       });
     }
 
-    const signKey = await this.pushKeys.resolve(studio);
+    const stream = `${tenant}__${studio}`;
+    const signKey = await this.pushKeys.resolve(stream);
     if (!signKey) {
       throw new ServiceUnavailableException({
         error: 'publish_not_configured',
-        hint: 'No push key available for this studio',
+        hint: `No push key configured for tenant ${tenant}`,
       });
     }
 
@@ -60,7 +58,6 @@ export class BigsurPublishService {
     );
     const expires = Math.floor(Date.now() / 1000) + ttl;
     const txTime = expires.toString(16);
-    const stream = studio;
 
     const txSecret = createHash('md5')
       .update(signKey + stream + txTime)

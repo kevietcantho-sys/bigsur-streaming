@@ -76,7 +76,6 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
       minExpires: env.SIGN_MIN_EXPIRES,
       maxExpires: env.SIGN_MAX_EXPIRES,
       defaultExpires: env.SIGN_DEFAULT_EXPIRES,
-      apiToken: env.SIGN_API_TOKEN,
       rateLimit: {
         ttl: env.SIGN_RATE_TTL,
         limit: env.SIGN_RATE_LIMIT,
@@ -92,7 +91,6 @@ function envOverrides(env: NodeJS.ProcessEnv): Record<string, unknown> {
     publish: {
       pushDomain: env.PUBLISH_DOMAIN,
       app: env.PUBLISH_APP,
-      signKey: env.PUBLISH_SIGN_KEY,
       minExpires: env.PUBLISH_MIN_EXPIRES,
       maxExpires: env.PUBLISH_MAX_EXPIRES,
       defaultExpires: env.PUBLISH_DEFAULT_EXPIRES,
@@ -140,11 +138,11 @@ export function loadConfig(): AppConfig {
     envOverrides(process.env),
   );
 
-  // Secrets live only in env — inject if absent so the schema sees a string.
+  // BunnyCDN tokenKey is reference-only since playback signing moved client-side;
+  // inject empty default so the schema sees a string. Per-tenant SIGN/PUBLISH
+  // secrets are read directly by TenantsService at boot.
   const withSecrets = deepMerge(merged, {
     bunny: { tokenKey: process.env.BUNNY_TOKEN_KEY ?? '' },
-    sign: { apiToken: process.env.SIGN_API_TOKEN ?? '' },
-    publish: { signKey: process.env.PUBLISH_SIGN_KEY ?? '' },
   });
 
   const parsed = configSchema.safeParse(withSecrets);

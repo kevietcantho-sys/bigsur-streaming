@@ -3,9 +3,11 @@ import {
   Controller,
   HttpCode,
   Post,
+  Req,
   UseGuards,
   UsePipes,
 } from '@nestjs/common';
+import type { Request } from 'express';
 import { ApiTokenGuard } from '../../common/guards/api-token.guard';
 import { ZodValidationPipe } from '../../common/pipes/zod-validation.pipe';
 import {
@@ -28,7 +30,10 @@ export class SignController {
   @Post('publish')
   @HttpCode(200)
   @UsePipes(new ZodValidationPipe(publishSignRequestSchema))
-  async signPublish(@Body() dto: PublishSignRequestDto) {
-    return this.publishSigner.sign(dto.studio, dto.expires_in ?? 0);
+  async signPublish(
+    @Req() req: Request & { tenant?: string },
+    @Body() dto: PublishSignRequestDto,
+  ) {
+    return this.publishSigner.sign(req.tenant!, dto.studio, dto.expires_in ?? 0);
   }
 }

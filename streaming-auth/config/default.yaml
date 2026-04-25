@@ -29,8 +29,10 @@ sign:
     limit: 120   # requests per ttl
 
 streams:
-  # Allowed stream name pattern (alphanum + _ -)
-  nameRegex: "^[a-zA-Z0-9_-]{1,64}$"
+  # Stream name = "<tenant>__<studio>" where:
+  #   tenant = [a-z0-9]{2,16} (low-entropy id; matches SIGN_API_TOKEN_<TENANT>)
+  #   studio = [a-zA-Z0-9_-]{1,48} (no "__" allowed inside studio)
+  nameRegex: "^[a-z0-9]{2,16}__[a-zA-Z0-9_-]{1,48}$"
 
 bunny:
   # CDN URL (pull zone). Required for /sign to succeed.
@@ -46,7 +48,8 @@ publish:
   app: "live"
   # Expiry bounds for txSecret tokens (seconds).
   # Long-lived by design — OBS setups shouldn't need daily re-mint.
-  # Rotating PUBLISH_SIGN_KEY invalidates every outstanding URL at once.
+  # Rotating PUBLISH_SIGN_KEY_<TENANT> invalidates every outstanding URL
+  # for that tenant at once (other tenants are unaffected).
   minExpires: 300          # 5 min
   maxExpires: 31536000     # 12 months
   defaultExpires: 2592000  # 30 days

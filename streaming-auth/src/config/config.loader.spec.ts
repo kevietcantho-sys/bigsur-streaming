@@ -9,32 +9,20 @@ function setEnv(env: Record<string, string | undefined>) {
 afterEach(() => { process.env = { ...ORIGINAL_ENV } as NodeJS.ProcessEnv; });
 
 describe('loadConfig', () => {
-  it('loads defaults + required env secrets', () => {
+  it('loads defaults', () => {
     setEnv({
-      SIGN_API_TOKEN: 'a'.repeat(64),
-      BUNNY_TOKEN_KEY: 'bunny',
-      BUNNY_CDN_URL: 'https://x.b-cdn.net',
       NODE_ENV: 'test',
       LOG_LEVEL: 'error',
     });
     const cfg = loadConfig();
     expect(cfg.server.port).toBe(3000);
     expect(cfg.streams.nameRegex).toMatch(/^/);
-    expect(cfg.bunny.cdnUrl).toBe('https://x.b-cdn.net');
-    expect(cfg.sign.apiToken.length).toBeGreaterThanOrEqual(16);
-  });
-
-  it('rejects too-short SIGN_API_TOKEN', () => {
-    setEnv({
-      SIGN_API_TOKEN: 'short',
-      NODE_ENV: 'test',
-    });
-    expect(() => loadConfig()).toThrow(/SIGN_API_TOKEN/);
+    // Per-tenant secrets (SIGN_API_TOKEN_<TENANT>, PUBLISH_SIGN_KEY_<TENANT>)
+    // are validated by TenantsService at boot, not by the YAML/zod schema.
   });
 
   it('env PORT overrides YAML default', () => {
     setEnv({
-      SIGN_API_TOKEN: 'a'.repeat(64),
       PORT: '4100',
       NODE_ENV: 'test',
     });

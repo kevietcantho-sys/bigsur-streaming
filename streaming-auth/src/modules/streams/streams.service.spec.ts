@@ -4,10 +4,11 @@ import { AppConfigService } from '../../config/app-config.service';
 import { PushKeyResolver } from './push-key.resolver';
 
 const SIGN_KEY = 'push-secret';
+const NAME_RE = '^[a-z0-9]{2,16}__[a-zA-Z0-9_-]{1,48}$';
 
 function buildService(signKey: string | null = SIGN_KEY) {
   const config = {
-    streams: { nameRegex: '^[a-zA-Z0-9_-]{1,64}$' },
+    streams: { nameRegex: NAME_RE },
   } as unknown as AppConfigService;
 
   const resolver: PushKeyResolver = {
@@ -28,7 +29,7 @@ describe('StreamsService.checkPublish', () => {
   const now = () => Math.floor(Date.now() / 1000);
 
   it('allows when txSecret + txTime match the push key', async () => {
-    const stream = 'LR-MNC3HOF8-5A9F04';
+    const stream = 'acme__LR-MNC3HOF8-5A9F04';
     const r = await svc.checkPublish(
       stream,
       mintParam(stream, SIGN_KEY, now() + 600),
@@ -37,7 +38,7 @@ describe('StreamsService.checkPublish', () => {
   });
 
   it('denies on bad signature', async () => {
-    const stream = 'studio1';
+    const stream = 'acme__studio1';
     const r = await svc.checkPublish(
       stream,
       mintParam(stream, 'wrong-key', now() + 600),
@@ -47,7 +48,7 @@ describe('StreamsService.checkPublish', () => {
   });
 
   it('denies when txTime is in the past', async () => {
-    const stream = 'studio1';
+    const stream = 'acme__studio1';
     const r = await svc.checkPublish(
       stream,
       mintParam(stream, SIGN_KEY, now() - 60),
@@ -57,7 +58,7 @@ describe('StreamsService.checkPublish', () => {
   });
 
   it('denies on malformed txTime', async () => {
-    const stream = 'studio1';
+    const stream = 'acme__studio1';
     const r = await svc.checkPublish(
       stream,
       '?txSecret=' + 'a'.repeat(32) + '&txTime=zzzz',
@@ -66,21 +67,27 @@ describe('StreamsService.checkPublish', () => {
     expect(r.reason).toBe('invalid txTime');
   });
 
-  it('denies invalid stream names', async () => {
-    const r = await svc.checkPublish('foo/bar', '?txSecret=x&txTime=1');
+  it('denies stream names without tenant prefix', async () => {
+    const r = await svc.checkPublish('studio1', '?txSecret=x&txTime=1');
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toBe('invalid stream');
+  });
+
+  it('denies stream names with invalid chars', async () => {
+    const r = await svc.checkPublish('acme__foo/bar', '?txSecret=x&txTime=1');
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe('invalid stream');
   });
 
   it('denies when no signature supplied', async () => {
-    const r = await svc.checkPublish('studio1', '');
+    const r = await svc.checkPublish('acme__studio1', '');
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe('missing signature');
   });
 
   it('denies when push key is not configured', async () => {
     const noKey = buildService(null);
-    const stream = 'studio1';
+    const stream = 'acme__studio1';
     const r = await noKey.checkPublish(
       stream,
       mintParam(stream, SIGN_KEY, now() + 600),
@@ -90,7 +97,7 @@ describe('StreamsService.checkPublish', () => {
   });
 
   it('accepts uppercase-hex txSecret (constant-time compare is case-insensitive on hex)', async () => {
-    const stream = 'studio1';
+    const stream = 'acme__studio1';
     const expires = now() + 600;
     const txTime = expires.toString(16);
     const txSecret = createHash('md5')

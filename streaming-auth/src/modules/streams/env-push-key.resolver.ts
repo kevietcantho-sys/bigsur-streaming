@@ -1,16 +1,19 @@
 import { Injectable } from '@nestjs/common';
-import { AppConfigService } from '../../config/app-config.service';
 import { PushKeyResolver } from './push-key.resolver';
+import { TenantsService } from '../tenants/tenants.service';
 
 /**
- * Single-key impl: every stream uses PUBLISH_SIGN_KEY from env.
- * Returns null when the key is empty so callers fail closed.
+ * Tenant-scoped resolver: stream `<tenant>__<studio>` → tenant's push key.
+ * Returns null when the stream isn't tenant-prefixed or the tenant is
+ * unknown so callers fail closed (deny publish, refuse to sign).
  */
 @Injectable()
 export class EnvPushKeyResolver extends PushKeyResolver {
-  constructor(private readonly config: AppConfigService) { super(); }
+  constructor(private readonly tenants: TenantsService) { super(); }
 
-  async resolve(_stream: string): Promise<string | null> {
-    return this.config.publish.signKey || null;
+  async resolve(stream: string): Promise<string | null> {
+    const parsed = TenantsService.parseStream(stream);
+    if (!parsed) return null;
+    return this.tenants.pushKey(parsed.tenant);
   }
 }

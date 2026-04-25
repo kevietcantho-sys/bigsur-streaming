@@ -10,6 +10,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { HealthModule } from './modules/health/health.module';
 import { StreamsModule } from './modules/streams/streams.module';
 import { SignModule } from './modules/sign/sign.module';
+import { TenantsModule } from './modules/tenants/tenants.module';
 
 @Module({
   imports: [
@@ -48,6 +49,7 @@ import { SignModule } from './modules/sign/sign.module';
       ],
     }),
 
+    TenantsModule,
     HealthModule,
     StreamsModule,
     SignModule,

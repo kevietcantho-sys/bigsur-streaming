@@ -29,6 +29,8 @@ export const configSchema = z.object({
     headers: z.string(),
   }),
 
+  // Bearer tokens for /sign/publish are per-tenant (SIGN_API_TOKEN_<TENANT>),
+  // loaded by TenantsService at boot. Only sizing/rate-limit knobs live here.
   sign: z.object({
     minExpires: z.coerce.number().int().positive(),
     maxExpires: z.coerce.number().int().positive(),
@@ -37,7 +39,6 @@ export const configSchema = z.object({
       ttl: z.coerce.number().int().positive(),
       limit: z.coerce.number().int().positive(),
     }),
-    apiToken: z.string().min(16, 'SIGN_API_TOKEN must be at least 16 chars'),
   }).refine(
     (v) => v.minExpires <= v.defaultExpires && v.defaultExpires <= v.maxExpires,
     { message: 'sign expires bounds must satisfy min <= default <= max' },
@@ -53,13 +54,13 @@ export const configSchema = z.object({
   }),
 
   // Publish-URL signing (txSecret/txTime).
-  // `/sign/publish` fails closed (503) when pushDomain or signKey are empty.
+  // pushDomain is the shared RTMP ingest hostname (one per deployment);
+  // per-tenant signing keys live in TenantsService (PUBLISH_SIGN_KEY_<TENANT>).
   // rtmpsEnabled gates the optional `url_rtmps` field — only flip on when
   // a Let's Encrypt cert is bound to :rtmpsPort (else OBS rejects the cert).
   publish: z.object({
     pushDomain: z.string(),
     app: z.string().min(1),
-    signKey: z.string(),
     minExpires: z.coerce.number().int().positive(),
     maxExpires: z.coerce.number().int().positive(),
     defaultExpires: z.coerce.number().int().positive(),
