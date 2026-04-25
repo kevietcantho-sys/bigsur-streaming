@@ -290,9 +290,10 @@ BUNNY_TOKEN_KEY=
 BUNNY_CDN_URL=
 
 # Publish URL signing (TencentCloud-CSS-style txSecret)
-# /sign/publish fails closed (503) until PUBLISH_DOMAIN + PUBLISH_SIGN_KEY are set.
+# Single global key today — SRS on_publish recomputes md5(key + stream + txTime).
+# /sign/publish + /srs/publish fail closed (403/503) until both are set.
 PUBLISH_DOMAIN=${PUBLISH_HOST:-}
-PUBLISH_APP=live
+PUBLISH_APP=luckylive
 PUBLISH_SIGN_KEY=$PUBLISH_SIGN_KEY
 
 # SRS API basic auth (used by monitoring only; set on SRS box too)
@@ -323,11 +324,18 @@ EOF
   KEEP THIS FILE PRIVATE. chmod 600.
 
   === OBS PUBLISHER ===
-  Server (RTMPS):  rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/live
-  Server (RTMP):   rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/live   # fallback only
-  Stream keys:
-    studio1?key=$STUDIO1_KEY
-    studio2?key=$STUDIO2_KEY
+  OBS auth now uses TencentCloud-CSS-style signed URLs.
+  Backend calls POST /sign/publish to mint an RTMP URL per publish session:
+    rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive/<studio>?txSecret=<md5>&txTime=<hex>
+  SRS on_publish recomputes md5(PUBLISH_SIGN_KEY + studio + txTime) to validate.
+
+  RTMPS fallback:  rtmps://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}:1936/luckylive
+  RTMP  fallback:  rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive
+
+  (STREAM_KEYS entries below are legacy — the secret values are not used
+   for publish auth anymore. The names still act as /sign playback allowlist.)
+    studio1 ($STUDIO1_KEY)
+    studio2 ($STUDIO2_KEY)
 
   === BACKEND → AUTH API ===
   Playback sign:   POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign

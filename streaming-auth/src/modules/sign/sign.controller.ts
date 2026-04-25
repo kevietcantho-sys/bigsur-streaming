@@ -39,7 +39,7 @@ export class SignController {
   @Post('publish')
   @HttpCode(200)
   @UsePipes(new ZodValidationPipe(publishSignRequestSchema))
-  signPublish(@Body() dto: PublishSignRequestDto) {
+  async signPublish(@Body() dto: PublishSignRequestDto) {
     return this.publishSigner.sign(dto.studio, dto.expires_in ?? 0);
   }
 }

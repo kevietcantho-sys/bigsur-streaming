@@ -44,10 +44,12 @@ publish:
   pushDomain: ""
   # RTMP app path component. Env: PUBLISH_APP
   app: "live"
-  # Expiry bounds for tcSecret tokens (seconds)
-  minExpires: 300
-  maxExpires: 86400
-  defaultExpires: 3600
+  # Expiry bounds for txSecret tokens (seconds).
+  # Long-lived by design — OBS setups shouldn't need daily re-mint.
+  # Rotating PUBLISH_SIGN_KEY invalidates every outstanding URL at once.
+  minExpires: 300          # 5 min
+  maxExpires: 31536000     # 12 months
+  defaultExpires: 2592000  # 30 days
   # signKey is a secret — set via env PUBLISH_SIGN_KEY only
 
 origin:

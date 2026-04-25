@@ -1,6 +1,7 @@
 import { Injectable, ServiceUnavailableException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import { AppConfigService } from '../../config/app-config.service';
+import { PushKeyResolver } from '../streams/push-key.resolver';
 
 export interface SignedPublishUrl {
   url: string;
@@ -17,14 +18,18 @@ export interface SignedPublishUrl {
  * Format: rtmp://<pushDomain>/<app>/<stream>?txSecret=<md5>&txTime=<hex>
  * Scheme: txSecret = md5(signKey + stream + txTime), txTime = hex(unix_expires).
  *
- * Tokens are stateless — SRS's on_publish hook recomputes the same md5 to
- * validate incoming publishes (see streams.controller for the validator).
+ * Tokens are stateless — SRS's on_publish hook (StreamsService.checkPublish)
+ * recomputes the same md5 via PushKeyResolver to validate incoming publishes.
+ * Sharing the resolver keeps minter and validator on one key source.
  */
 @Injectable()
 export class TencentPublishService {
-  constructor(private readonly config: AppConfigService) {}
+  constructor(
+    private readonly config: AppConfigService,
+    private readonly pushKeys: PushKeyResolver,
+  ) {}
 
-  sign(studio: string, expiresIn: number): SignedPublishUrl {
+  async sign(studio: string, expiresIn: number): Promise<SignedPublishUrl> {
     if (!this.config.publishReady) {
       throw new ServiceUnavailableException({
         error: 'publish_not_configured',
@@ -32,7 +37,15 @@ export class TencentPublishService {
       });
     }
 
-    const { pushDomain, app, signKey, minExpires, maxExpires, defaultExpires } =
+    const signKey = await this.pushKeys.resolve(studio);
+    if (!signKey) {
+      throw new ServiceUnavailableException({
+        error: 'publish_not_configured',
+        hint: 'No push key available for this studio',
+      });
+    }
+
+    const { pushDomain, app, minExpires, maxExpires, defaultExpires } =
       this.config.publish;
 
     const ttl = Math.max(

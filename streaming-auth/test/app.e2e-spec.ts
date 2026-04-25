@@ -1,13 +1,22 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
+import { createHash } from 'node:crypto';
 import request from 'supertest';
 
 import { AppModule } from '../src/app.module';
 
 const API_TOKEN = 'a'.repeat(64);
+const PUBLISH_SIGN_KEY = 'publish-secret';
 
 function setEnv(env: Record<string, string>) {
   for (const [k, v] of Object.entries(env)) process.env[k] = v;
+}
+
+function mintPublishParam(stream: string, ttlSec = 600, signKey = PUBLISH_SIGN_KEY) {
+  const expires = Math.floor(Date.now() / 1000) + ttlSec;
+  const txTime = expires.toString(16);
+  const txSecret = createHash('md5').update(signKey + stream + txTime).digest('hex');
+  return { param: `?txSecret=${txSecret}&txTime=${txTime}`, expires, txTime, txSecret };
 }
 
 describe('streaming-auth (e2e)', () => {
@@ -22,7 +31,7 @@ describe('streaming-auth (e2e)', () => {
       BUNNY_CDN_URL: 'https://stream.b-cdn.net',
       PUBLISH_DOMAIN: 'bspush.example.com',
       PUBLISH_APP: 'luckylive',
-      PUBLISH_SIGN_KEY: 'publish-secret',
+      PUBLISH_SIGN_KEY,
       LOG_LEVEL: 'error',
       // very high rate limit so tests don't trip throttling
       SIGN_RATE_TTL: '60000',
@@ -48,26 +57,46 @@ describe('streaming-auth (e2e)', () => {
 
   //─── /srs/publish ──────────────────────────────────────────────
   describe('POST /srs/publish', () => {
-    it('allows valid stream+key', async () => {
+    it('allows valid txSecret+txTime', async () => {
+      const { param } = mintPublishParam('studio1');
       const r = await request(app.getHttpServer())
         .post('/srs/publish')
-        .send({ stream: 'studio1', param: '?key=secret1' });
+        .send({ stream: 'studio1', param });
       expect(r.status).toBe(200);
       expect(r.body).toEqual({ code: 0, data: 'OK' });
     });
 
-    it('denies wrong key', async () => {
+    it('denies wrong signature', async () => {
+      const { param } = mintPublishParam('studio1', 600, 'not-the-real-key');
       const r = await request(app.getHttpServer())
         .post('/srs/publish')
-        .send({ stream: 'studio1', param: '?key=wrong' });
+        .send({ stream: 'studio1', param });
+      expect(r.status).toBe(200);
+      expect(r.body.code).toBe(403);
+    });
+
+    it('denies expired txTime', async () => {
+      const { param } = mintPublishParam('studio1', -60);
+      const r = await request(app.getHttpServer())
+        .post('/srs/publish')
+        .send({ stream: 'studio1', param });
+      expect(r.status).toBe(200);
+      expect(r.body.code).toBe(403);
+    });
+
+    it('denies missing signature', async () => {
+      const r = await request(app.getHttpServer())
+        .post('/srs/publish')
+        .send({ stream: 'studio1', param: '' });
       expect(r.status).toBe(200);
       expect(r.body.code).toBe(403);
     });
 
     it('denies invalid stream name', async () => {
+      const { param } = mintPublishParam('bad/name');
       const r = await request(app.getHttpServer())
         .post('/srs/publish')
-        .send({ stream: 'bad/name', param: '?key=secret1' });
+        .send({ stream: 'bad/name', param });
       expect(r.status).toBe(200);
       expect(r.body.code).toBe(403);
     });
@@ -176,9 +205,8 @@ describe('streaming-auth (e2e)', () => {
         .set('Authorization', `Bearer ${API_TOKEN}`)
         .send({ studio: 'studio1', expires_in: 3600 });
       expect(r.status).toBe(200);
-      const { createHash } = await import('node:crypto');
       const expected = createHash('md5')
-        .update('publish-secret' + 'studio1' + r.body.txTime)
+        .update(PUBLISH_SIGN_KEY + 'studio1' + r.body.txTime)
         .digest('hex');
       expect(r.body.txSecret).toBe(expected);
     });

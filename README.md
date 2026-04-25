@@ -29,8 +29,8 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
 - **Sign API**: Backend calls `https://api.example.com/sign` (orange-cloud) — Cloudflare terminates public TLS with its Universal SSL cert, then re-encrypts to HAProxy using the Cloudflare Origin Cert.
 - **Viewer playback**: BunnyCDN edge serves the HLS manifest + segments to viewers via the signed URL returned by `/sign`.
 - **Auth**:
-  - Publishers: SRS calls `streaming-auth /srs/publish` to validate per-stream `?key=`.
-  - Viewers: backend calls `POST /sign` (Bearer token) → returns BunnyCDN signed URL.
+  - Publishers: backend calls `POST /sign/publish` (Bearer) → returns TencentCloud-CSS-style `rtmp://.../<studio>?txSecret=<md5>&txTime=<hex>`. SRS `on_publish` hits `streaming-auth /srs/publish` which recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` and rejects expired / mismatched signatures.
+  - Viewers: backend calls `POST /sign` (Bearer) → returns BunnyCDN signed URL.
 
 ---
 
@@ -48,7 +48,7 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
 
 ```
 streaming-auth/
-├── config/default.yaml          # non-secret defaults (ports, limits, regex)
+├── config/default.yaml          # non-secret defaults (ports, limits, regex, publish app)
 ├── src/
 │   ├── main.ts                  # bootstrap (trust proxy, CORS, shutdown hooks)
 │   ├── app.module.ts            # wires config + logger + throttler + modules
@@ -57,12 +57,15 @@ streaming-auth/
 │   └── modules/
 │       ├── health/              # GET  /health
 │       ├── streams/             # POST /srs/publish, /srs/unpublish (VPC-only)
-│       │   ├── stream-keys.repository.ts      # interface (DB-ready)
-│       │   └── env-stream-keys.repository.ts  # current impl — STREAM_KEYS env
-│       └── sign/                # POST /sign (Bearer guard + rate limited)
-│           ├── bunny.service.ts # md5 token minting (BunnyCDN spec)
-│           └── dto/             # zod request schemas
-└── test/app.e2e-spec.ts         # supertest coverage for all 4 routes
+│       │   ├── stream-keys.repository.ts      # playback allowlist interface (DB-ready)
+│       │   ├── env-stream-keys.repository.ts  # STREAM_KEYS env impl
+│       │   ├── push-key.resolver.ts           # publish-key indirection (per-client ready)
+│       │   └── env-push-key.resolver.ts       # single PUBLISH_SIGN_KEY impl
+│       └── sign/                # POST /sign, POST /sign/publish (Bearer guard + rate limited)
+│           ├── bunny.service.ts            # md5 token minting (BunnyCDN spec)
+│           ├── tencent-publish.service.ts  # TencentCloud-CSS-style publish URL minter
+│           └── dto/                        # zod request schemas
+└── test/app.e2e-spec.ts         # supertest coverage for all 5 routes
 ```
 
 ---
@@ -126,15 +129,16 @@ The script will:
 2. Build `/etc/haproxy/certs/origin.pem` from `$SSL_CERT_PATH` + `$SSL_KEY_PATH` (CF Origin Cert, bound on `:443`).
 3. If `$LETSENCRYPT_EMAIL` is set: issue a Let's Encrypt cert for `$PUBLISH_HOST` via HTTP-01 on port 80, build `/etc/haproxy/certs/publish.pem`, bind it on `:1936` (RTMPS), and install pre/post/deploy renewal hooks (HAProxy briefly stops for the challenge during renewal).
 4. Copy `streaming-auth/` → `/opt/streaming-auth/`, run `npm ci && npm run build && npm prune --omit=dev`.
-5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, stream keys, SRS API creds.
+5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, legacy `STREAM_KEYS` allowlist, SRS API creds. `PUBLISH_DOMAIN` defaults to `$PUBLISH_HOST`, `PUBLISH_APP=luckylive`.
 6. Install the `streaming-auth.service` systemd unit (running `node dist/main.js`).
-7. Write HAProxy config with TLS, rate limits, CORS, and `/sign` + SRS backend routing.
+7. Write HAProxy config with TLS, rate limits, CORS, and `/sign` + `/sign/publish` + SRS backend routing.
 
 > **RTMPS vs RTMP**: OBS validates the cert chain against public CAs on RTMPS. The Cloudflare Origin Certificate is not publicly trusted, so using it on :1936 breaks OBS. The script solves this with Let's Encrypt (set `LETSENCRYPT_EMAIL`). If you skip LE, :1936 falls back to the CF Origin Cert and OBS will reject it — use plain RTMP on :1935 in that case.
 
 Generates credentials at `/root/STREAM_KEYS.txt` (chmod 600). Contains:
-- OBS stream keys (`studio1`, `studio2`)
-- `SIGN_API_TOKEN` for backend → `/sign`
+- `SIGN_API_TOKEN` for backend → `/sign` and `/sign/publish`
+- `PUBLISH_SIGN_KEY` (md5 input for publish URL signing — keep private)
+- Legacy `STREAM_KEYS` names (`studio1`, `studio2`) used only as the `/sign` playback allowlist
 - `SRS_API_USER` / `SRS_API_PASS` — pass to SRS box below
 
 ### 2. SRS origin
@@ -208,9 +212,26 @@ Backend calls `https://api.example.com/sign` — no cert pinning needed, standar
 ## Publish & Play
 
 **OBS (RTMPS if `LETSENCRYPT_EMAIL` was set, else plain RTMP):**
-- RTMPS: `rtmps://$PUBLISH_HOST:1936/live`
-- RTMP:  `rtmp://$PUBLISH_HOST/live` (no TLS; fine for trusted networks)
-- Stream key: `studio1?key=<secret>`
+
+Backend mints a signed URL per publish session via `POST /sign/publish`:
+
+```bash
+curl -X POST https://api.example.com/sign/publish \
+  -H "Authorization: Bearer <SIGN_API_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"studio":"LR-MNC3HOF8-5A9F04","expires_in":3600}'
+# → { "url": "rtmp://bspush.example.com/luckylive/LR-MNC3HOF8-5A9F04?txSecret=<md5>&txTime=<hex>", ... }
+```
+
+Split the returned URL at the last `/` in OBS:
+- **Server**: `rtmp://$PUBLISH_HOST/luckylive` (or `rtmps://$PUBLISH_HOST:1936/luckylive`)
+- **Stream key**: `<studio>?txSecret=<md5>&txTime=<hex>`
+
+SRS's `on_publish` hook recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` via
+`streaming-auth/src/modules/streams/streams.service.ts` and rejects expired /
+mismatched signatures. Today a single `PUBLISH_SIGN_KEY` signs all studios;
+`PushKeyResolver` (`streaming-auth/src/modules/streams/push-key.resolver.ts`)
+is the indirection point for future per-client keys.
 
 **Viewer (via backend):**
 ```bash
@@ -254,7 +275,7 @@ Click **▶ Load**. Reload auto-plays using the saved values.
 
 ### Prerequisites for it to actually play
 
-- OBS is currently publishing to `rtmp://$PUBLISH_HOST/live` with key `studio1?key=<secret>`.
+- OBS is currently publishing to `rtmp://$PUBLISH_HOST/luckylive` with a `<studio>?txSecret=...&txTime=...` key minted by `POST /sign/publish`.
 - `BUNNY_TOKEN_KEY` + `BUNNY_CDN_URL` set in `/opt/streaming-auth/.env` and the service restarted.
 - BunnyCDN pull zone is configured with origin `https://$PLAYBACK_ORIGIN_HOST` and **"Verify origin SSL certificate"** disabled.
 - Your sign-endpoint hostname resolves and serves a cert the browser accepts (use the CF-proxied `api.*` hostname for frictionless local testing).
@@ -277,10 +298,10 @@ Click **▶ Load**. Reload auto-plays using the saved values.
 ```bash
 cd streaming-auth
 npm install
-cp .env.example .env             # fill SIGN_API_TOKEN + STREAM_KEYS + BUNNY_*
+cp .env.example .env             # fill SIGN_API_TOKEN + STREAM_KEYS + PUBLISH_* + BUNNY_*
 npm run start:dev                # hot reload
 npm test                         # unit tests
-npm run test:e2e                 # e2e covering all 4 routes
+npm run test:e2e                 # e2e covering all 5 routes
 npm run build && node dist/main.js
 ```
 
@@ -306,16 +327,19 @@ Env knobs that override YAML:
 | `ORIGIN_HOST` / `ORIGIN_PORT` | `origin.*` |
 | `LOG_LEVEL` / `LOG_FORMAT` | `logger.*` |
 | `BUNNY_CDN_URL` | `bunny.cdnUrl` |
+| `PUBLISH_DOMAIN` / `PUBLISH_APP` | `publish.pushDomain` / `publish.app` |
 
 **Env-only (secrets — never in YAML):**
-- `SIGN_API_TOKEN` — required, ≥16 chars.
-- `STREAM_KEYS` — required, format `name1:secret1,name2:secret2`.
+- `SIGN_API_TOKEN` — required, ≥16 chars. Bearer for `/sign` and `/sign/publish`.
+- `STREAM_KEYS` — required, format `name1:secret1,name2:secret2`. Names act as the `/sign` playback allowlist; the `:secret` half is legacy and unused by publish auth.
+- `PUBLISH_SIGN_KEY` — required for `/sign/publish` + `/srs/publish` to succeed (else 503/deny). Signs all studios today; one key per client in the planned per-client model.
 - `BUNNY_TOKEN_KEY` — required for `/sign` to succeed (else 503).
 
 ### Extending the service
 
 - **Add an endpoint**: new module under `src/modules/` → import in `app.module.ts`.
 - **Back stream keys with a DB**: implement `StreamKeysRepository` (e.g. `PgStreamKeysRepository`), swap the provider in `streams.module.ts`. Zero controller/service changes.
+- **Per-client push keys**: implement `PushKeyResolver.resolve(stream)` to look up `stream → client → pushKey` (e.g. `ClientPushKeyResolver`) and swap the provider in `streams.module.ts`. Minter (`tencent-publish.service.ts`) and validator (`streams.service.ts`) both read through the resolver — no other changes needed. A leaked key then only invalidates the studios owned by that client.
 - **Validation**: write zod schemas in `dto/`, apply via `ZodValidationPipe`.
 - **Auth another route**: `@UseGuards(ApiTokenGuard)` on the controller/handler.
 
@@ -342,7 +366,8 @@ Env knobs that override YAML:
 
 **Public (HAProxy):**
 - `GET  /health` → `ok`
-- `POST /sign` → signed CDN URL _(requires `Authorization: Bearer`)_
+- `POST /sign` → signed BunnyCDN playback URL _(requires `Authorization: Bearer`)_
+- `POST /sign/publish` → signed RTMP push URL for OBS _(requires `Authorization: Bearer`)_
 - `:1936` RTMPS ingest, `:1935` RTMP (fallback)
 - `:443 /live/*.m3u8` CDN origin
 
@@ -374,7 +399,7 @@ systemctl restart srs                       # on origin
 bash setup-streaming-infra.sh haproxy
 ```
 
-Rotate `SIGN_API_TOKEN` or stream keys: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`.
+Rotate `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, or `STREAM_KEYS`: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`. Rotating `PUBLISH_SIGN_KEY` invalidates every live OBS URL — publishers must re-fetch from `/sign/publish`.
 
 ---
 
@@ -383,13 +408,14 @@ Rotate `SIGN_API_TOKEN` or stream keys: edit `/opt/streaming-auth/.env` → `sys
 | Symptom | Check |
 |---------|-------|
 | `/sign` returns 503 | `BUNNY_TOKEN_KEY` / `BUNNY_CDN_URL` unset in `.env` |
-| `/sign` returns 401 | Missing/wrong `Authorization: Bearer` header |
+| `/sign/publish` returns 503 | `PUBLISH_DOMAIN` / `PUBLISH_SIGN_KEY` unset in `.env` |
+| `/sign` or `/sign/publish` returns 401 | Missing/wrong `Authorization: Bearer` header |
 | OBS "Failed to connect socket" (25s timeout) | `PUBLISH_HOST` DNS is orange-cloud. CF doesn't proxy 1935/1936 — flip to grey. |
 | OBS "invalid SSL certificate" on RTMPS | OBS rejects the Cloudflare Origin Cert (not publicly trusted). Use plain RTMP on `:1935` or issue a Let's Encrypt cert via DNS-01 for `$PUBLISH_HOST`. |
 | Viewer 403 from CDN | Token Auth key mismatch, clock drift, expired URL, **or** you fetched without going through `/sign` (Token Authentication is on) |
 | BunnyCDN origin fetch fails with TLS error | Turn off "Verify origin SSL certificate" in the pull zone |
 | SRS systemd exits 255, log says `getifaddrs failed … Address family not supported` | `RestrictAddressFamilies` missing `AF_NETLINK`. Fixed in current script — `daemon-reload` + restart. |
-| SRS publish rejected | Stream key mismatch → `journalctl -u streaming-auth` shows `[DENY]` |
+| SRS publish rejected | `journalctl -u streaming-auth` shows the reason: `missing signature`, `expired`, `bad signature`, `no key`, or `invalid stream`. Re-mint via `/sign/publish` (the URL has a finite `txTime`). |
 | HLS 404 at edge | SRS not generating segments → check `on_publish` hook reached auth service, and OBS is actively publishing |
 
 ---
