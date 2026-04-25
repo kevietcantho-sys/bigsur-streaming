@@ -110,53 +110,9 @@ describe('streaming-auth (e2e)', () => {
     expect(r.body).toEqual({ code: 0 });
   });
 
-  //─── /sign ─────────────────────────────────────────────────────
-  describe('POST /sign', () => {
-    it('401 without Bearer token', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .send({ stream: 'studio1' });
-      expect(r.status).toBe(401);
-    });
-
-    it('401 with wrong token', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .set('Authorization', 'Bearer wrongwrongwrongwrong')
-        .send({ stream: 'studio1' });
-      expect(r.status).toBe(401);
-    });
-
-    it('400 on invalid stream name', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .set('Authorization', `Bearer ${API_TOKEN}`)
-        .send({ stream: 'bad/name' });
-      expect(r.status).toBe(400);
-    });
-
-    it('200 mints a signed URL for any well-formed stream name', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .set('Authorization', `Bearer ${API_TOKEN}`)
-        .send({ stream: 'LR-MODTAJC7-2979AB', expires_in: 600 });
-      expect(r.status).toBe(200);
-      expect(r.body.url).toMatch(/^https:\/\/stream\.b-cdn\.net\/live\/LR-MODTAJC7-2979AB\.m3u8\?token=/);
-      expect(typeof r.body.expires).toBe('number');
-      expect(typeof r.body.expires_at).toBe('string');
-    });
-
-    it('clamps expires_in to configured bounds', async () => {
-      const r = await request(app.getHttpServer())
-        .post('/sign')
-        .set('Authorization', `Bearer ${API_TOKEN}`)
-        .send({ stream: 'studio1', expires_in: 999999 });
-      expect(r.status).toBe(200);
-      const nowSec = Math.floor(Date.now() / 1000);
-      // maxExpires from default.yaml = 3600
-      expect(r.body.expires - nowSec).toBeLessThanOrEqual(3600 + 2);
-    });
-  });
+  // POST /sign (playback) was removed — clients sign BunnyCDN URLs locally
+  // with their own (pull_zone, BUNNY_TOKEN_KEY) pair. Algorithm coverage
+  // lives in src/modules/sign/bunny.service.spec.ts (kept as reference).
 
   //─── /sign/publish ─────────────────────────────────────────────
   describe('POST /sign/publish', () => {
@@ -252,40 +208,8 @@ describe('streaming-auth — RTMPS enabled', () => {
   });
 });
 
-describe('streaming-auth — CDN not configured (503)', () => {
-  let app: INestApplication;
-
-  beforeAll(async () => {
-    setEnv({
-      NODE_ENV: 'test',
-      SIGN_API_TOKEN: API_TOKEN,
-      BUNNY_TOKEN_KEY: '',
-      BUNNY_CDN_URL: '',
-      LOG_LEVEL: 'error',
-      SIGN_RATE_TTL: '60000',
-      SIGN_RATE_LIMIT: '10000',
-    });
-
-    const mod: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
-    app = mod.createNestApplication();
-    await app.init();
-  });
-
-  afterAll(async () => { await app.close(); });
-
-  it('503 when Bunny not configured', async () => {
-    const r = await request(app.getHttpServer())
-      .post('/sign')
-      .set('Authorization', `Bearer ${API_TOKEN}`)
-      .send({ stream: 'studio1' });
-    expect(r.status).toBe(503);
-    expect(r.body.error).toBe('cdn_not_configured');
-  });
-
-  it('/health reports cdn: pending', async () => {
-    const r = await request(app.getHttpServer()).get('/health');
-    expect(r.body.cdn).toBe('pending');
-  });
-});
+// "CDN not configured" describe block was removed alongside POST /sign —
+// the playback signer is no longer wired into the app, so there is no
+// runtime path that returns 503 cdn_not_configured anymore. /health may
+// still report `cdn: pending` cosmetically; that surface lives in the
+// health controller and is exercised by its own checks.

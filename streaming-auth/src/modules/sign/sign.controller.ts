@@ -12,28 +12,17 @@ import {
   PublishSignRequestDto,
   publishSignRequestSchema,
 } from './dto/publish-sign-request.dto';
-import {
-  SignRequestDto,
-  signRequestSchema,
-} from './dto/sign-request.dto';
-import { SignService } from './sign.service';
 import { BigsurPublishService } from './bigsur-publish.service';
+
+// Playback URL signing (POST /sign) was removed: clients now generate
+// BunnyCDN signed URLs locally with their own (pull_zone, token_key) pair.
+// SignService + BunnyService + sign-request.dto remain in the tree as
+// reference for the signing algorithm.
 
 @Controller('sign')
 @UseGuards(ApiTokenGuard)
 export class SignController {
-  constructor(
-    private readonly signService: SignService,
-    private readonly publishSigner: BigsurPublishService,
-  ) {}
-
-  /** Playback URL signer — BunnyCDN token-authenticated HLS manifest. */
-  @Post()
-  @HttpCode(200)
-  @UsePipes(new ZodValidationPipe(signRequestSchema))
-  sign(@Body() dto: SignRequestDto) {
-    return this.signService.sign(dto);
-  }
+  constructor(private readonly publishSigner: BigsurPublishService) {}
 
   /** Publish URL signer — txSecret/txTime RTMP(S) push URL for OBS. */
   @Post('publish')

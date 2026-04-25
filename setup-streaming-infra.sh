@@ -277,10 +277,12 @@ HOOK_EOF
 # Base defaults live in config/default.yaml. Env vars win over YAML.
 # ═══════════════════════════════════════════════════════════════
 
-# Bearer token required to call POST /sign and POST /sign/publish (backend only)
+# Bearer token required to call POST /sign/publish (backend only)
 SIGN_API_TOKEN=$SIGN_API_TOKEN
 
-# BunnyCDN — REQUIRED. /sign fails closed (503) until both are set.
+# BunnyCDN — playback signing moved to clients (each tenant holds its own
+# pull zone + token key). These fields are kept for the reference signer
+# at src/modules/sign/bunny.service.ts; leave blank in production.
 BUNNY_TOKEN_KEY=
 BUNNY_CDN_URL=
 
@@ -331,12 +333,14 @@ EOF
   RTMP  fallback:  rtmp://${PUBLISH_HOST:-$HAPROXY_PUBLIC_IP}/luckylive
 
   === BACKEND → AUTH API ===
-  Playback sign:   POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign
-                   body: {"stream":"<studio>","expires_in":600}
   Publish sign:    POST https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}/sign/publish
                    body: {"studio":"<studio>","expires_in":2592000}
   Authorization header: Bearer $SIGN_API_TOKEN
   Publish sign key (MD5 input):  $PUBLISH_SIGN_KEY
+
+  Playback signing was removed — each client holds its own BunnyCDN pull
+  zone + Authentication Key and signs URLs locally. Reference algorithm:
+  streaming-auth/src/modules/sign/bunny.service.ts.
 
   === SRS HTTP API (internal monitoring) ===
   User: admin
@@ -344,13 +348,11 @@ EOF
   (Set the same values on the SRS box; used by on the srs role below.)
 
   === NEXT STEPS ===
-  1) Create BunnyCDN pull zone. Origin URL:
+  1) Create one BunnyCDN pull zone per client. Origin URL:
        https://${PLAYBACK_ORIGIN_HOST:-$HAPROXY_PUBLIC_IP}
-  2) Enable Token Authentication in BunnyCDN; copy the security key.
-  3) Update /opt/streaming-auth/.env:
-       BUNNY_TOKEN_KEY=<key from BunnyCDN>
-       BUNNY_CDN_URL=https://<your-pullzone>.b-cdn.net
-     Then: systemctl restart streaming-auth
+  2) Enable Token Authentication on each pull zone and hand the
+     Authentication Key + pull-zone hostname to that tenant.
+  3) Tenant signs playback URLs locally (no auth-service config needed).
 ═══════════════════════════════════════════════════════════════
 EOF
         chmod 600 /root/STREAM_KEYS.txt
@@ -660,10 +662,11 @@ SYSCTL_EOF
     AUTH=$(curl -sf -m 3 "http://$HAPROXY_VPC_IP:3000/health" 2>/dev/null || true)
     echo "$AUTH" | grep -q '"status":"ok"' && ok "Auth service health" || warn "Auth failed"
 
-    # /sign without token must return 401
-    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost/sign \
-           -H 'Content-Type: application/json' -d '{"stream":"studio1"}' || true)
-    [ "$CODE" = "401" ] && ok "/sign auth enforcement (401 without token)" || warn "/sign returned $CODE, expected 401"
+    # /sign/publish without token must return 401 (playback /sign was removed —
+    # clients sign BunnyCDN URLs locally with their own BUNNY_TOKEN_KEY).
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost/sign/publish \
+           -H 'Content-Type: application/json' -d '{"studio":"studio1"}' || true)
+    [ "$CODE" = "401" ] && ok "/sign/publish auth enforcement (401 without token)" || warn "/sign/publish returned $CODE, expected 401"
 
     #─── Summary ───────────────────────────────────────────────────────────────
     echo ""
