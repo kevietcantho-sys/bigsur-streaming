@@ -427,6 +427,7 @@ HOOK_EOF
         DEFAULT_TENANT_TOKEN=$(openssl rand -hex 32)
         DEFAULT_TENANT_KEY=$(openssl rand -hex 32)
         SRS_API_PASS=$(openssl rand -hex 16)
+        WROTE_NEW_ENV=1
 
         cat > "$APP_DIR/.env" <<EOF
 # ═══════════════════════════════════════════════════════════════
@@ -480,9 +481,26 @@ LOG_FORMAT=json
 NODE_ENV=production
 EOF
         chmod 640 "$APP_DIR/.env"
+    else
+        warn "Keeping existing .env"
+    fi
 
-        # Save credentials for operator
-        cat > /root/STREAM_KEYS.txt <<EOF
+    # Always (re)generate /root/STREAM_KEYS.txt so it tracks the current script.
+    # On a fresh install we use the freshly-minted secrets above; on re-runs we
+    # source values from the live .env so the file matches what the service uses.
+    if [ "${WROTE_NEW_ENV:-0}" != "1" ] && [ -f "$APP_DIR/.env" ]; then
+        # shellcheck disable=SC1090,SC1091
+        # Read KEY=VALUE pairs without executing them (avoid surprises if a
+        # value contains shell metachars).
+        DEFAULT_TENANT_TOKEN=$(grep -E '^SIGN_API_TOKEN_DEFAULT=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
+        DEFAULT_TENANT_KEY=$(grep -E '^PUBLISH_SIGN_KEY_DEFAULT=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
+        SRS_API_PASS=$(grep -E '^SRS_API_PASS=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
+        : "${DEFAULT_TENANT_TOKEN:=<missing-in-env>}"
+        : "${DEFAULT_TENANT_KEY:=<missing-in-env>}"
+        : "${SRS_API_PASS:=<missing-in-env>}"
+    fi
+
+    cat > /root/STREAM_KEYS.txt <<EOF
 ═══════════════════════════════════════════════════════════════
   STREAM INFRASTRUCTURE CREDENTIALS — Generated $(date)
   Server: haproxy-edge ($HAPROXY_PUBLIC_IP)
@@ -529,11 +547,8 @@ EOF
   3) Tenant signs playback URLs locally (no auth-service config needed).
 ═══════════════════════════════════════════════════════════════
 EOF
-        chmod 600 /root/STREAM_KEYS.txt
-        ok "Credentials saved to /root/STREAM_KEYS.txt"
-    else
-        warn "Keeping existing .env"
-    fi
+    chmod 600 /root/STREAM_KEYS.txt
+    ok "Credentials written to /root/STREAM_KEYS.txt"
 
     # Clean up any legacy flat-file deployment from previous versions of this script
     [ -f /opt/streaming-auth/server.js ] && rm -f /opt/streaming-auth/server.js
