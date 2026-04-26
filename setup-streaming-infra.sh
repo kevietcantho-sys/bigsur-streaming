@@ -489,12 +489,13 @@ EOF
     # On a fresh install we use the freshly-minted secrets above; on re-runs we
     # source values from the live .env so the file matches what the service uses.
     if [ "${WROTE_NEW_ENV:-0}" != "1" ] && [ -f "$APP_DIR/.env" ]; then
-        # shellcheck disable=SC1090,SC1091
         # Read KEY=VALUE pairs without executing them (avoid surprises if a
-        # value contains shell metachars).
-        DEFAULT_TENANT_TOKEN=$(grep -E '^SIGN_API_TOKEN_DEFAULT=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
-        DEFAULT_TENANT_KEY=$(grep -E '^PUBLISH_SIGN_KEY_DEFAULT=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
-        SRS_API_PASS=$(grep -E '^SRS_API_PASS=' "$APP_DIR/.env" | head -n1 | cut -d= -f2-)
+        # value contains shell metachars). `|| true` keeps set -e + pipefail
+        # quiet when a key is missing from older .env files.
+        env_get() { grep -E "^$1=" "$APP_DIR/.env" 2>/dev/null | head -n1 | cut -d= -f2- || true; }
+        DEFAULT_TENANT_TOKEN=$(env_get SIGN_API_TOKEN_DEFAULT)
+        DEFAULT_TENANT_KEY=$(env_get PUBLISH_SIGN_KEY_DEFAULT)
+        SRS_API_PASS=$(env_get SRS_API_PASS)
         : "${DEFAULT_TENANT_TOKEN:=<missing-in-env>}"
         : "${DEFAULT_TENANT_KEY:=<missing-in-env>}"
         : "${SRS_API_PASS:=<missing-in-env>}"
