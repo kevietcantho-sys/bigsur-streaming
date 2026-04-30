@@ -1059,6 +1059,12 @@ vhost __defaultVhost__ {
 
     publish {
         mr              off;
+        # Close publish session if no media packet for 10s. Catches half-open
+        # TCP (e.g. OBS process killed without RTMP unpublish) — without this,
+        # SRS waits on default OS keepalive (hours) and on_unpublish never fires.
+        normal_timeout      10000;
+        # Close publish session if first media packet doesn't arrive within 20s.
+        firstpkt_timeout    20000;
     }
 
     # Auth callbacks to streaming-auth (over VPC)
@@ -1074,7 +1080,10 @@ vhost __defaultVhost__ {
         hls_fragment        2;
         hls_window          20;
         hls_cleanup         on;
-        hls_dispose         30;
+        # Delete .m3u8 + segments 5s after on_unpublish. Combined with
+        # publish.normal_timeout above, total cleanup window after a dead
+        # publisher is ~15s.
+        hls_dispose         5;
         hls_wait_keyframe   on;
         hls_ctx             off;
         hls_ts_ctx          off;
@@ -1089,6 +1098,18 @@ vhost __defaultVhost__ {
 PRODCFG_EOF
     chown srs:srs /opt/srs/trunk/conf/production.conf
     ok "Config written"
+
+    #─── Kernel tuning (TCP keepalive for half-open publishers) ────────────────
+    # If a publisher's network drops without a clean FIN, the kernel keeps the
+    # socket ESTABLISHED for 2+ hours by default. Tighten so dead RTMP sockets
+    # die in ~60s, which SRS observes as a connection drop → on_unpublish fires.
+    cat > /etc/sysctl.d/99-srs.conf <<'SYSCTL_EOF'
+net.ipv4.tcp_keepalive_time = 30
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+SYSCTL_EOF
+    sysctl -p /etc/sysctl.d/99-srs.conf >/dev/null
+    ok "TCP keepalive tuned"
 
     # PID dir (tmpfiles so it survives reboot)
     mkdir -p /var/run/srs
