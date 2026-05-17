@@ -240,6 +240,11 @@ frontend https_in
     option http-keep-alive
     http-response set-header Strict-Transport-Security \"max-age=31536000; includeSubDomains\"
 
+    # path_beg/path_end are request-phase fetches — used directly in an
+    # http-response rule they silently never match. Capture the path into a
+    # txn variable in the request phase so the http-response rules below work.
+    http-request set-var(txn.req_path) path
+
     acl is_health path /health
     http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
 
@@ -248,9 +253,9 @@ frontend https_in
 
     # CORS only for HLS playback paths — /sign is a bearer-authed
     # backend-to-backend API and needs no cross-origin exposure.
-    http-response set-header Access-Control-Allow-Origin \"*\" if !{ path_beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ path_beg /sign }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ path_beg /sign }
+    http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
 
     stick-table type ip size 100k expire 60s store http_req_rate(10s)
     http-request track-sc0 src if { path_beg /sign }
@@ -311,6 +316,11 @@ frontend http_in
     option httplog
     option http-keep-alive
 
+    # path_beg/path_end are request-phase fetches — used directly in an
+    # http-response rule they silently never match. Capture the path into a
+    # txn variable in the request phase so the http-response rules below work.
+    http-request set-var(txn.req_path) path
+
     acl is_health path /health
     http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
 
@@ -319,9 +329,9 @@ frontend http_in
 
     # CORS only for HLS playback paths — /sign is a bearer-authed
     # backend-to-backend API and needs no cross-origin exposure.
-    http-response set-header Access-Control-Allow-Origin \"*\" if !{ path_beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ path_beg /sign }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ path_beg /sign }
+    http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
 
     stick-table type ip size 100k expire 60s store http_req_rate(10s)
     http-request track-sc0 src if { path_beg /sign }
@@ -384,9 +394,13 @@ backend srs_origin
     http-reuse safe
     timeout connect 3s
     timeout server 30s
-    http-response set-header Cache-Control "public, max-age=1" if { path_end .m3u8 }
-    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { path_end .ts }
-    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { path_end .m4s }
+    # path_end is a request-phase fetch — used directly in http-response it
+    # silently never matches (HAProxy 2.8 warns: "anonymous acl will never
+    # match"). Capture the path in the request phase, match the variable here.
+    http-request set-var(txn.req_path) path
+    http-response set-header Cache-Control "public, max-age=1" if { var(txn.req_path) -m end .m3u8 }
+    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { var(txn.req_path) -m end .ts }
+    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { var(txn.req_path) -m end .m4s }
     server origin1 ${SRS_VPC_IP}:8080 check inter 10s rise 2 fall 3 maxconn 1000
 
 backend auth_service
