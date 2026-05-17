@@ -60,7 +60,7 @@ sleep 1
 
 # --- packages ---------------------------------------------------------------
 apt_install build-essential cmake automake autoconf libtool patch \
-    libssl-dev pkg-config git wget curl ufw python3
+    libssl-dev pkg-config git wget curl unzip ufw python3
 
 hostnamectl set-hostname srs-origin
 idempotent_append "127.0.1.1 srs-origin" /etc/hosts
