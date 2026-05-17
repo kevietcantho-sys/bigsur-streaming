@@ -19,9 +19,12 @@ export class BunnyService {
    */
   signPlaylist(stream: string, expiresIn: number, viewerIp?: string): SignedUrl {
     const { cdnUrl, tokenKey } = this.config.bunny;
+    const { app } = this.config.publish;
     const expires = Math.floor(Date.now() / 1000) + expiresIn;
-    const playlistPath = `/live/${stream}.m3u8`;
-    const tokenPath = `/live/`;
+    // SRS writes HLS under the RTMP app name (PUBLISH_APP), so the playlist
+    // and the BunnyCDN directory token both live at /<app>/.
+    const tokenPath = `/${app}/`;
+    const playlistPath = `${tokenPath}${stream}.m3u8`;
 
     let hashInput = tokenKey + tokenPath + expires;
     if (viewerIp) hashInput += viewerIp;

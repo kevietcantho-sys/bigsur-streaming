@@ -45,7 +45,7 @@ publish:
   # Can be overridden via env: PUBLISH_DOMAIN
   pushDomain: ""
   # RTMP app path component. Env: PUBLISH_APP
-  app: "live"
+  app: "luckylive"
   # Expiry bounds for txSecret tokens (seconds).
   # Long-lived by design — OBS setups shouldn't need daily re-mint.
   # Rotating PUBLISH_SIGN_KEY_<TENANT> invalidates every outstanding URL

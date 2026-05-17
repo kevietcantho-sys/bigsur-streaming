@@ -2,11 +2,16 @@ import { createHash } from 'node:crypto';
 import { BunnyService } from './bunny.service';
 import { AppConfigService } from '../../config/app-config.service';
 
-function makeConfig(overrides?: Partial<{ cdnUrl: string; tokenKey: string }>) {
+function makeConfig(
+  overrides?: Partial<{ cdnUrl: string; tokenKey: string; app: string }>,
+) {
   return {
     bunny: {
       cdnUrl: overrides?.cdnUrl ?? 'https://stream.b-cdn.net',
       tokenKey: overrides?.tokenKey ?? 'test-key',
+    },
+    publish: {
+      app: overrides?.app ?? 'luckylive',
     },
     get bunnyReady() {
       return Boolean(this.bunny.cdnUrl && this.bunny.tokenKey);
@@ -32,15 +37,15 @@ describe('BunnyService', () => {
     expect(expires).toBe(expectedExpires);
 
     const expectedToken = createHash('md5')
-      .update('test-key' + '/live/' + expectedExpires)
+      .update('test-key' + '/luckylive/' + expectedExpires)
       .digest()
       .toString('base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 
     const parsed = new URL(url);
-    expect(parsed.origin + parsed.pathname).toBe('https://stream.b-cdn.net/live/studio1.m3u8');
+    expect(parsed.origin + parsed.pathname).toBe('https://stream.b-cdn.net/luckylive/studio1.m3u8');
     expect(parsed.searchParams.get('token')).toBe(expectedToken);
-    expect(parsed.searchParams.get('token_path')).toBe('/live/');
+    expect(parsed.searchParams.get('token_path')).toBe('/luckylive/');
     expect(parsed.searchParams.get('expires')).toBe(String(expectedExpires));
   });
 
@@ -59,7 +64,7 @@ describe('BunnyService', () => {
     const t1 = new URL(svc.signPlaylist('studio1', 60).url).searchParams.get('token');
     const t2 = new URL(svc.signPlaylist('studio2', 60).url).searchParams.get('token');
     // Token only depends on token_path/expires/key/(ip); same across streams
-    // because token_path stays `/live/`. This asserts current behavior so
+    // because token_path stays `/<app>/`. This asserts current behavior so
     // future changes to token_path per-stream are deliberate.
     expect(t1).toBe(t2);
   });

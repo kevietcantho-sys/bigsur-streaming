@@ -12,6 +12,7 @@
 #   STREAM_AUTH_VPC_IP    Override bind IP (default: $HAPROXY_VPC_IP)
 #   STREAM_AUTH_PORT      Bind port (default: 3000)
 #   PUBLISH_HOST          Written into .env as PUBLISH_DOMAIN
+#   PUBLISH_APP           SRS RTMP app / HLS path segment (default: luckylive)
 #   LETSENCRYPT_EMAIL     If set, PUBLISH_RTMPS_ENABLED=true in .env
 #   SRS_API_USER          Default: admin
 #   SRS_API_PASS          Default: auto-generate on first run
@@ -63,6 +64,7 @@ SRS_VPC_IP="${SRS_VPC_IP:-}"
 STREAM_AUTH_VPC_IP="${STREAM_AUTH_VPC_IP:-${HAPROXY_VPC_IP}}"
 STREAM_AUTH_PORT="${STREAM_AUTH_PORT:-3000}"
 PUBLISH_HOST="${PUBLISH_HOST:-}"
+PUBLISH_APP="${PUBLISH_APP:-luckylive}"
 PLAYBACK_ORIGIN_HOST="${PLAYBACK_ORIGIN_HOST:-}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 SRS_API_USER="${SRS_API_USER:-admin}"
@@ -148,7 +150,7 @@ BUNNY_CDN_URL=
 
 # Publish URL signing (txSecret/txTime).
 PUBLISH_DOMAIN=${PUBLISH_HOST}
-PUBLISH_APP=luckylive
+PUBLISH_APP=${PUBLISH_APP}
 PUBLISH_RTMPS_ENABLED=${LETSENCRYPT_EMAIL:+true}
 PUBLISH_RTMPS_PORT=1936
 
