@@ -20,6 +20,9 @@ logs/
 .env.local
 .env.*.local
 
+# Credential snapshots pulled back by infrastructure deploy wrappers
+.STREAM_KEYS.*
+
 # Node (belt-and-suspenders; streaming-auth/.gitignore also covers these)
 node_modules/
 dist/
