@@ -39,11 +39,32 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
 
 | Path | Purpose |
 |------|---------|
-| `setup-streaming-infra.sh` | Idempotent setup script — run once per box with role `haproxy` or `srs`. |
+| `infrastructure/scripts/` | Idempotent setup scripts — one per role + a local remote wrapper for each. See layout below. |
 | `streaming-auth/` | NestJS auth service (SRS publish hooks + BunnyCDN URL signing). |
 | `test.html` | Standalone hls.js player with Low-latency / Balanced / Stable modes + live stats. |
-| `BunnyCDN-Auth-Production-Guide.docx` | Operator guide for BunnyCDN Token Authentication setup. |
 | `CLAUDE.md` | Claude Code agent instructions (workflows/rules). |
+
+### `infrastructure/scripts/` layout
+
+```
+infrastructure/scripts/
+├── .env.example              # shared config (copy to .env, edit, gitignored)
+├── common/
+│   └── lib.sh                # shared bash helpers (logging, apt, ufw, env_get, …)
+├── stream-auth/
+│   ├── setup-stream-auth.sh        # deploys streaming-auth NestJS on a box
+│   └── setup-stream-auth-remote.sh # LOCAL wrapper — rsyncs source + script, runs remote
+├── haproxy/
+│   ├── setup-haproxy.sh            # haproxy + TLS + bunny edge refresher
+│   └── setup-haproxy-remote.sh     # LOCAL wrapper
+└── srs/
+    ├── setup-srs.sh                # SRS build + systemd + firewall
+    └── setup-srs-remote.sh         # LOCAL wrapper
+```
+
+Each `*-remote.sh` runs from your laptop: loads `infrastructure/scripts/.env`,
+SSHes to the target, uploads `setup-*.sh` + `common/lib.sh` (and `streaming-auth/`
+for stream-auth) into `/tmp/`, then executes the role script as root.
 
 ### `streaming-auth/` layout
 
@@ -99,58 +120,92 @@ Defaults (override with env vars):
 
 ## Deploy
 
-The setup script expects the **whole repo** on the HAProxy box so it can rsync + build `streaming-auth/` in place.
+Setup is split into 3 role scripts, each with a local remote wrapper. Run from
+your laptop — each wrapper SCPs the role script + `common/lib.sh` (and the
+`streaming-auth/` source tree for stream-auth) to the target and executes as root.
 
-### 1. HAProxy edge
+### 0. Configure once
 
 ```bash
-# Sync repo to the box (excludes local builds/secrets)
-rsync -a --exclude node_modules --exclude dist --exclude .env \
-  ./ root@<haproxy-ip>:/root/bigsur-streaming/
+cd infrastructure/scripts
+cp .env.example .env
+$EDITOR .env   # set HAPROXY_VPC_IP, SRS_VPC_IP, PUBLISH_HOST,
+               # PLAYBACK_ORIGIN_HOST, LETSENCRYPT_EMAIL, etc.
+```
 
+Upload the Cloudflare Origin Certificate to the HAProxy box first:
+
+```bash
 ssh root@<haproxy-ip>
-
-# Upload the Cloudflare Origin Certificate + key first
-# (generated in CF dashboard → SSL/TLS → Origin Server → Create Certificate,
-#  using a wildcard like *.example.com so it covers both hostnames)
 sudo mkdir -p /etc/ssl/cloudflare
-sudo tee /etc/ssl/cloudflare/origin.pem > /dev/null   # paste cert, Enter, Ctrl+D
-sudo tee /etc/ssl/cloudflare/origin.key > /dev/null   # paste key,  Enter, Ctrl+D
+sudo tee /etc/ssl/cloudflare/origin.pem > /dev/null   # paste cert, Ctrl+D
+sudo tee /etc/ssl/cloudflare/origin.key > /dev/null   # paste key,  Ctrl+D
 sudo chmod 644 /etc/ssl/cloudflare/origin.pem
 sudo chmod 600 /etc/ssl/cloudflare/origin.key
-
-cd /root/bigsur-streaming
-PUBLISH_HOST=bspush.example.com \
-PLAYBACK_ORIGIN_HOST=origin.example.com \
-LETSENCRYPT_EMAIL=ops@example.com \
-bash setup-streaming-infra.sh haproxy
+exit
 ```
 
-The script will:
-1. Install Node 20, HAProxy, certbot, rsync.
-2. Build `/etc/haproxy/certs/origin.pem` from `$SSL_CERT_PATH` + `$SSL_KEY_PATH` (CF Origin Cert, bound on `:443`).
-3. If `$LETSENCRYPT_EMAIL` is set: issue a Let's Encrypt cert for `$PUBLISH_HOST` via HTTP-01 on port 80, build `/etc/haproxy/certs/publish.pem`, bind it on `:1936` (RTMPS), and install pre/post/deploy renewal hooks (HAProxy briefly stops for the challenge during renewal).
-4. Copy `streaming-auth/` → `/opt/streaming-auth/`, run `npm ci && npm run build && npm prune --omit=dev`.
-5. Generate `/opt/streaming-auth/.env` with random `SIGN_API_TOKEN`, `PUBLISH_SIGN_KEY`, SRS API creds. `PUBLISH_DOMAIN` defaults to `$PUBLISH_HOST`, `PUBLISH_APP=luckylive`.
-6. Install the `streaming-auth.service` systemd unit (running `node dist/main.js`).
-7. Write HAProxy config with TLS, rate limits, CORS, and `/sign/publish` + SRS backend routing.
-
-> **RTMPS vs RTMP**: OBS validates the cert chain against public CAs on RTMPS. The Cloudflare Origin Certificate is not publicly trusted, so using it on :1936 breaks OBS. The script solves this with Let's Encrypt (set `LETSENCRYPT_EMAIL`). If you skip LE, :1936 falls back to the CF Origin Cert and OBS will reject it — use plain RTMP on :1935 in that case.
-
-Generates credentials at `/root/STREAM_KEYS.txt` (chmod 600). Contains:
-- `SIGN_API_TOKEN` for backend → `/sign/publish`
-- `PUBLISH_SIGN_KEY` (md5 input for publish URL signing — keep private)
-- `SRS_API_USER` / `SRS_API_PASS` — pass to SRS box below
-
-### 2. SRS origin
+### 1. stream-auth (NestJS) → HAProxy box
 
 ```bash
-scp setup-streaming-infra.sh root@<srs-ip>:/root/
-ssh root@<srs-ip>
-SRS_API_USER=admin \
-SRS_API_PASS=<from-STREAM_KEYS.txt> \
-bash setup-streaming-infra.sh srs
+./infrastructure/scripts/stream-auth/setup-stream-auth-remote.sh <haproxy-ip>
 ```
+
+This wrapper rsyncs `streaming-auth/`, builds with `npm ci && npm run build`,
+generates `/opt/streaming-auth/.env` (with `SIGN_API_TOKEN_DEFAULT`,
+`PUBLISH_SIGN_KEY_DEFAULT`, `SRS_API_PASS` on first run), installs the
+`streaming-auth.service` systemd unit, and writes `/root/STREAM_KEYS.txt`
+(chmod 600) on the box. It also pulls a copy of `STREAM_KEYS.txt` back to
+`infrastructure/scripts/.STREAM_KEYS.<host>.txt` so the SRS wrapper can recover
+`SRS_API_PASS` automatically.
+
+### 2. HAProxy edge → same HAProxy box
+
+```bash
+./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
+```
+
+This installs HAProxy + certbot, builds `/etc/haproxy/certs/origin.pem` from
+`SSL_CERT_PATH` + `SSL_KEY_PATH`, optionally issues a Let's Encrypt cert for
+`PUBLISH_HOST` on `:1936` (when `LETSENCRYPT_EMAIL` is set), installs the
+BunnyCDN edge IP refresher (`/usr/local/sbin/refresh-bunny-edges.sh` + hourly
+cron), and writes `/etc/haproxy/haproxy.cfg` with TLS, rate limits, CORS, and
+`/sign` → stream-auth + HLS → SRS backend routing.
+
+> **RTMPS vs RTMP**: OBS validates against public CAs on RTMPS. The Cloudflare
+> Origin Certificate is not publicly trusted, so binding it on :1936 breaks OBS.
+> Set `LETSENCRYPT_EMAIL` in `.env` to fix. Without LE, use plain RTMP `:1935`.
+
+### 3. SRS origin → SRS box
+
+```bash
+./infrastructure/scripts/srs/setup-srs-remote.sh <srs-ip>
+# SRS_API_PASS is auto-recovered from .STREAM_KEYS.<haproxy-ip>.txt.
+# Override with -p <pass> or by setting SRS_API_PASS in .env.
+```
+
+Builds SRS from the pinned tag (`SRS_VERSION=v6.0-r0` by default), writes
+`/opt/srs/trunk/conf/production.conf` with the LL-HLS knobs + on_publish hooks
+back to stream-auth at `$STREAM_AUTH_VPC_IP:$STREAM_AUTH_PORT` (defaults to
+`$HAPROXY_VPC_IP` when colocated), and installs the `srs.service` systemd unit.
+
+#### Scaling stream-auth to its own VPS
+
+stream-auth is colocated with HAProxy by default. To move it to a separate box
+(for horizontal scale, blast-radius isolation, or independent rollouts):
+
+1. In `infrastructure/scripts/.env`, set `STREAM_AUTH_VPC_IP=<new-vps-vpc-ip>`.
+2. Re-run all three wrappers, pointing each at the right host:
+   ```bash
+   ./infrastructure/scripts/stream-auth/setup-stream-auth-remote.sh <stream-auth-ip>
+   ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh         <haproxy-ip>
+   ./infrastructure/scripts/srs/setup-srs-remote.sh                 <srs-ip>
+   ```
+
+The HAProxy `auth_service` backend, SRS `on_publish` hooks, and UFW rules on
+all three boxes pick up `STREAM_AUTH_VPC_IP` automatically. The stream-auth box
+opens :3000 from both `$HAPROXY_VPC_IP` (for `/sign/*`) and `$SRS_VPC_IP` (for
+`/srs/publish` + `/srs/unpublish`).
 
 ### 3. BunnyCDN
 
@@ -259,7 +314,7 @@ curl -X POST https://api.example.com/sign/publish \
 #   }
 ```
 
-`url_rtmps` is only present when `PUBLISH_RTMPS_ENABLED=true` (set by `setup-streaming-infra.sh` automatically when `LETSENCRYPT_EMAIL` was provided). Without an LE cert on `:1936`, OBS rejects the handshake — keep the flag off and stick to plain RTMP.
+`url_rtmps` is only present when `PUBLISH_RTMPS_ENABLED=true` (set by `setup-haproxy.sh` automatically when `LETSENCRYPT_EMAIL` was provided). Without an LE cert on `:1936`, OBS rejects the handshake — keep the flag off and stick to plain RTMP.
 
 Split the returned URL at the last `/` in OBS:
 - **Server**: `rtmp://$PUBLISH_HOST/luckylive` (or `rtmps://$PUBLISH_HOST:1936/luckylive`)
@@ -442,7 +497,7 @@ Env knobs that override YAML:
 
 Today the HAProxy edge IP and `$PUBLISH_HOST` / `$PLAYBACK_ORIGIN_HOST` hostnames are public. Three things absorb most of the realistic threat surface; ship in this order.
 
-**1. Lock HLS pull to BunnyCDN edge IPs.** (Built into `setup-streaming-infra.sh`.)
+**1. Lock HLS pull to BunnyCDN edge IPs.** (Built into `setup-haproxy.sh`.)
 Bunny publishes its edge list (https://api.bunny.net/system/edgeserverlist + IPv6 variant). Without this, anyone who learns a tenant's `<tenant>__<studio>` can hit `https://$HAPROXY_PUBLIC_IP/luckylive/<tenant>__<studio>.m3u8` directly and bypass BunnyCDN Token Auth entirely.
 
 The setup script always installs:
@@ -454,15 +509,15 @@ The HAProxy ACL itself is gated by `BUNNY_EDGE_GUARD`:
 
 ```bash
 # Option A: ship without enforcement (script + cron still installed; status quo)
-bash setup-streaming-infra.sh haproxy   # default BUNNY_EDGE_GUARD=off
+./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>   # default BUNNY_EDGE_GUARD=off
 
 # Option B: monitor mode — non-Bunny hits log at alert level, no deny.
 #  Soak for a week, grep `journalctl -u haproxy | grep alert`, then flip.
-BUNNY_EDGE_GUARD=monitor bash setup-streaming-infra.sh haproxy
+BUNNY_EDGE_GUARD=monitor ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
 
 # Option C: enforce mode — non-Bunny IPs get 403.
 #  Pre-flight refuses if the seed list is empty / has <30 IPs.
-BUNNY_EDGE_GUARD=enforce bash setup-streaming-infra.sh haproxy
+BUNNY_EDGE_GUARD=enforce ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
 ```
 
 The ACL bypass list (`/health`, `/sign/*`, OPTIONS preflights) is hard-coded so the guard never gates the control plane — only HLS pull traffic.
@@ -520,8 +575,10 @@ tail -f /var/log/srs/srs.log
 systemctl restart streaming-auth haproxy    # on edge
 systemctl restart srs                       # on origin
 
-# Re-run setup (idempotent; keeps existing .env)
-bash setup-streaming-infra.sh haproxy
+# Re-run setup (all three remote wrappers are idempotent; keep existing .env)
+./infrastructure/scripts/stream-auth/setup-stream-auth-remote.sh <haproxy-ip>
+./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
+./infrastructure/scripts/srs/setup-srs-remote.sh <srs-ip>
 ```
 
 Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`. Rotating `PUBLISH_SIGN_KEY` invalidates every live OBS URL — publishers must re-fetch from `/sign/publish`.
@@ -548,7 +605,8 @@ Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` �
 ## Dev mode (no TLS, not for prod)
 
 ```bash
-ALLOW_NO_TLS=1 bash setup-streaming-infra.sh haproxy
+ALLOW_NO_TLS=1 ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
+# (or set ALLOW_NO_TLS=1 in infrastructure/scripts/.env)
 ```
 
 Skips the Cloudflare Origin Cert lookup and binds plain HTTP on `:80` + RTMP on `:1935`. BunnyCDN + `/sign/publish` still work over HTTP.
