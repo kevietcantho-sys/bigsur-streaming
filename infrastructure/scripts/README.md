@@ -37,9 +37,9 @@ infrastructure/scripts/
 - **Target boxes**: Ubuntu 22.04 / 24.04 LTS with passwordless `sudo` (or SSH
   in as `root` directly).
 - **Local machine**: `bash`, `ssh`, `scp`, `rsync`, `openssl`.
-- **HAProxy box**: Cloudflare Origin Cert pre-uploaded to `SSL_CERT_PATH` and
-  `SSL_KEY_PATH` (defaults `/etc/ssl/cloudflare/origin.pem` + `.key`). Skip
-  with `ALLOW_NO_TLS=1` for dev only.
+- **HAProxy box**: public port 80 reachable, with the `PUBLISH_HOST` and
+  `PLAYBACK_ORIGIN_HOST` A-records pointed at it — `setup-haproxy.sh` issues a
+  Let's Encrypt SAN cert over HTTP-01. Skip with `ALLOW_NO_TLS=1` for dev only.
 
 ## Configure once
 
@@ -56,15 +56,14 @@ Required values:
 | `SRS_VPC_IP`            | VPC IP of the SRS origin box |
 | `HAPROXY_PUBLIC_IP`     | Public IP of HAProxy (printed in `STREAM_KEYS.txt`) |
 | `PUBLISH_HOST`          | OBS ingest hostname (grey-cloud DNS) |
-| `PLAYBACK_ORIGIN_HOST`  | Origin hostname BunnyCDN pulls from |
-| `SSL_CERT_PATH` / `SSL_KEY_PATH` | Cloudflare Origin Cert on the HAProxy box |
+| `PLAYBACK_ORIGIN_HOST`  | Origin hostname BunnyCDN pulls from (grey-cloud DNS) |
+| `LETSENCRYPT_EMAIL`     | Email for the Let's Encrypt SAN cert (HTTP-01 on :80) |
 
 Optional / advanced:
 
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `SSH_USER`             | `root`    | SSH user for all wrappers (override per-call with `-u`) |
-| `LETSENCRYPT_EMAIL`    | _(unset)_ | If set, HAProxy issues an LE cert for `PUBLISH_HOST` on `:1936` so OBS can do RTMPS |
 | `ALLOW_NO_TLS`         | `0`       | `1` skips TLS entirely (dev only) |
 | `BUNNY_EDGE_GUARD`     | `off`     | `off` \| `monitor` \| `enforce` — locks HLS pull paths to BunnyCDN edge IPs |
 | `STREAM_AUTH_VPC_IP`   | `$HAPROXY_VPC_IP` | Where stream-auth binds. Set when running it on its own VPS. |
@@ -144,8 +143,7 @@ Flags must come **before** the host IPs.
 | stream-auth | `/etc/systemd/system/streaming-auth.service` | Hardened systemd unit |
 | stream-auth | `/root/STREAM_KEYS.txt`                   | Credentials snapshot (chmod 600) |
 | HAProxy     | `/etc/haproxy/haproxy.cfg`                | Generated config (HTTP/HTTPS/RTMP/RTMPS) |
-| HAProxy     | `/etc/haproxy/certs/origin.pem`           | CF Origin Cert (combined) |
-| HAProxy     | `/etc/haproxy/certs/publish.pem`          | LE cert for RTMPS (if `LETSENCRYPT_EMAIL` set) |
+| HAProxy     | `/etc/haproxy/certs/origin.pem`           | Let's Encrypt SAN cert — combined fullchain+key, served on `:443` + `:1936` |
 | HAProxy     | `/usr/local/sbin/refresh-bunny-edges.sh`  | Hourly cron — refreshes Bunny edge IP allowlist |
 | HAProxy     | `/etc/haproxy/lists/bunny-edges.lst`      | Current Bunny edge IP list |
 | HAProxy     | `/etc/cron.d/bunny-edges`                 | Cron schedule (`@reboot` + `17 * * * *`) |

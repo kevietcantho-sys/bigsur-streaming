@@ -11,11 +11,11 @@
 # Required for TLS (unless ALLOW_NO_TLS=1):
 #   PUBLISH_HOST          OBS ingest hostname (grey-cloud)
 #   PLAYBACK_ORIGIN_HOST  BunnyCDN origin hostname (grey-cloud)
-#   SSL_CERT_PATH         Cloudflare Origin Certificate (default /etc/ssl/cloudflare/origin.pem)
-#   SSL_KEY_PATH          Cloudflare Origin private key (default /etc/ssl/cloudflare/origin.key)
+#   LETSENCRYPT_EMAIL     Email for the Let's Encrypt SAN cert covering both
+#                         hosts. Issued via HTTP-01 — both A-records must
+#                         point here and public :80 must be reachable.
 #
 # Optional:
-#   LETSENCRYPT_EMAIL     If set, issue LE cert for PUBLISH_HOST on :1936 (RTMPS for OBS)
 #   ALLOW_NO_TLS=1        Skip TLS entirely (dev only)
 #   STREAM_AUTH_VPC_IP    Backend host for /sign* (default: $HAPROXY_VPC_IP)
 #   STREAM_AUTH_PORT      Backend port (default: 3000)
@@ -42,8 +42,6 @@ SRS_VPC_IP="${SRS_VPC_IP:-}"
 HAPROXY_PUBLIC_IP="${HAPROXY_PUBLIC_IP:-}"
 PUBLISH_HOST="${PUBLISH_HOST:-}"
 PLAYBACK_ORIGIN_HOST="${PLAYBACK_ORIGIN_HOST:-}"
-SSL_CERT_PATH="${SSL_CERT_PATH:-/etc/ssl/cloudflare/origin.pem}"
-SSL_KEY_PATH="${SSL_KEY_PATH:-/etc/ssl/cloudflare/origin.key}"
 LETSENCRYPT_EMAIL="${LETSENCRYPT_EMAIL:-}"
 ALLOW_NO_TLS="${ALLOW_NO_TLS:-0}"
 STREAM_AUTH_VPC_IP="${STREAM_AUTH_VPC_IP:-${HAPROXY_VPC_IP}}"
@@ -60,8 +58,7 @@ esac
 if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
     arg_required "PUBLISH_HOST"         "${PUBLISH_HOST}"         "PUBLISH_HOST=<host>"
     arg_required "PLAYBACK_ORIGIN_HOST" "${PLAYBACK_ORIGIN_HOST}" "PLAYBACK_ORIGIN_HOST=<host>"
-    [[ -f "${SSL_CERT_PATH}" ]] || die "SSL_CERT_PATH not found: ${SSL_CERT_PATH} (upload CF Origin Cert first)"
-    [[ -f "${SSL_KEY_PATH}"  ]] || die "SSL_KEY_PATH not found: ${SSL_KEY_PATH}"
+    arg_required "LETSENCRYPT_EMAIL"    "${LETSENCRYPT_EMAIL}"    "LETSENCRYPT_EMAIL=<email>"
 else
     warn "ALLOW_NO_TLS=1 — TLS disabled. DO NOT use in production."
 fi
@@ -77,63 +74,62 @@ apt_install haproxy certbot ufw curl ca-certificates jq python3
 hostnamectl set-hostname haproxy-edge
 idempotent_append "127.0.1.1 haproxy-edge" /etc/hosts
 
-# --- TLS certs --------------------------------------------------------------
-RTMPS_CERT_PATH=/etc/haproxy/certs/origin.pem
+# --- TLS certs (Let's Encrypt — one SAN cert for :443 HLS + :1936 RTMPS) -----
+# CF Origin Certs are only trusted by Cloudflare. PLAYBACK_ORIGIN_HOST is
+# grey-cloud (BunnyCDN pulls it directly, CF not in path) so the origin needs
+# a publicly-trusted cert. One LE SAN cert covers the HLS origin host and the
+# OBS ingest host; HAProxy serves it on both :443 and :1936.
+TLS_CERT_PATH=/etc/haproxy/certs/origin.pem
 if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
     mkdir -p /etc/haproxy/certs
     chown root:haproxy /etc/haproxy/certs
     chmod 750 /etc/haproxy/certs
 
-    log "Building combined PEM from ${SSL_CERT_PATH} + ${SSL_KEY_PATH}..."
-    cat "${SSL_CERT_PATH}" "${SSL_KEY_PATH}" > /etc/haproxy/certs/origin.pem
-    chmod 640 /etc/haproxy/certs/origin.pem
-    chown root:haproxy /etc/haproxy/certs/origin.pem
-    ok "HTTPS cert at /etc/haproxy/certs/origin.pem (Cloudflare Origin)"
+    LE_LIVE="/etc/letsencrypt/live/${PLAYBACK_ORIGIN_HOST}"
+    if [[ ! -f "${LE_LIVE}/fullchain.pem" ]]; then
+        log "Obtaining Let's Encrypt cert for ${PLAYBACK_ORIGIN_HOST} + ${PUBLISH_HOST} (HTTP-01 on :80)..."
+        systemctl stop haproxy 2>/dev/null || true
+        certbot certonly --standalone --non-interactive --agree-tos \
+            -m "${LETSENCRYPT_EMAIL}" \
+            --cert-name "${PLAYBACK_ORIGIN_HOST}" \
+            -d "${PLAYBACK_ORIGIN_HOST}" -d "${PUBLISH_HOST}" \
+            --preferred-challenges http
+        ok "Let's Encrypt cert issued"
+    else
+        ok "Let's Encrypt cert already present"
+    fi
 
-    if [[ -n "${LETSENCRYPT_EMAIL}" ]]; then
-        LE_LIVE="/etc/letsencrypt/live/${PUBLISH_HOST}"
-        if [[ ! -f "${LE_LIVE}/fullchain.pem" ]]; then
-            log "Obtaining Let's Encrypt cert for ${PUBLISH_HOST} (HTTP-01 on :80)..."
-            systemctl stop haproxy 2>/dev/null || true
-            certbot certonly --standalone --non-interactive --agree-tos \
-                -m "${LETSENCRYPT_EMAIL}" -d "${PUBLISH_HOST}" \
-                --preferred-challenges http
-            ok "Let's Encrypt cert issued"
-        else
-            ok "Let's Encrypt cert already present"
-        fi
+    cat "${LE_LIVE}/fullchain.pem" "${LE_LIVE}/privkey.pem" > "${TLS_CERT_PATH}"
+    chmod 640 "${TLS_CERT_PATH}"
+    chown root:haproxy "${TLS_CERT_PATH}"
+    ok "TLS cert at ${TLS_CERT_PATH} (Let's Encrypt — ${PLAYBACK_ORIGIN_HOST}, ${PUBLISH_HOST})"
 
-        cat "${LE_LIVE}/fullchain.pem" "${LE_LIVE}/privkey.pem" > /etc/haproxy/certs/publish.pem
-        chmod 640 /etc/haproxy/certs/publish.pem
-        chown root:haproxy /etc/haproxy/certs/publish.pem
-        RTMPS_CERT_PATH=/etc/haproxy/certs/publish.pem
-
-        # Renewal hooks
-        mkdir -p /etc/letsencrypt/renewal-hooks/{pre,post,deploy}
-        cat > /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh <<'PRE_EOF'
+    # Renewal hooks — stop haproxy for the HTTP-01 challenge, rebuild the
+    # combined PEM on deploy, restart.
+    mkdir -p /etc/letsencrypt/renewal-hooks/{pre,post,deploy}
+    # Drop the stale hook from the old CF-Origin-Cert layout, if present.
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/haproxy-publish.sh
+    cat > /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh <<'PRE_EOF'
 #!/bin/bash
 systemctl stop haproxy
 PRE_EOF
-        cat > /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh <<'POST_EOF'
+    cat > /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh <<'POST_EOF'
 #!/bin/bash
 systemctl start haproxy
 POST_EOF
-        cat > /etc/letsencrypt/renewal-hooks/deploy/haproxy-publish.sh <<HOOK_EOF
+    cat > /etc/letsencrypt/renewal-hooks/deploy/haproxy-cert.sh <<HOOK_EOF
 #!/bin/bash
 set -e
-cat /etc/letsencrypt/live/${PUBLISH_HOST}/fullchain.pem \\
-    /etc/letsencrypt/live/${PUBLISH_HOST}/privkey.pem \\
-    > /etc/haproxy/certs/publish.pem
-chmod 640 /etc/haproxy/certs/publish.pem
-chown root:haproxy /etc/haproxy/certs/publish.pem
+cat /etc/letsencrypt/live/${PLAYBACK_ORIGIN_HOST}/fullchain.pem \\
+    /etc/letsencrypt/live/${PLAYBACK_ORIGIN_HOST}/privkey.pem \\
+    > ${TLS_CERT_PATH}
+chmod 640 ${TLS_CERT_PATH}
+chown root:haproxy ${TLS_CERT_PATH}
 HOOK_EOF
-        chmod +x /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh \
-                 /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh \
-                 /etc/letsencrypt/renewal-hooks/deploy/haproxy-publish.sh
-        ok "RTMPS cert: /etc/haproxy/certs/publish.pem (Let's Encrypt, auto-renew)"
-    else
-        warn "LETSENCRYPT_EMAIL unset — :1936 will use CF Origin Cert (OBS will reject). Use plain RTMP :1935."
-    fi
+    chmod +x /etc/letsencrypt/renewal-hooks/pre/haproxy-stop.sh \
+             /etc/letsencrypt/renewal-hooks/post/haproxy-start.sh \
+             /etc/letsencrypt/renewal-hooks/deploy/haproxy-cert.sh
+    ok "Auto-renew hooks installed (deploy → rebuild ${TLS_CERT_PATH})"
 fi
 
 # --- BunnyCDN edge IP refresher ---------------------------------------------
@@ -265,7 +261,7 @@ ${BUNNY_GUARD_DEFS}
     default_backend srs_origin
 
 frontend rtmps_in
-    bind *:1936 ssl crt ${RTMPS_CERT_PATH}
+    bind *:1936 ssl crt ${TLS_CERT_PATH}
     mode tcp
     option tcplog
     timeout client 24h

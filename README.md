@@ -12,7 +12,7 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
    OBS ──── RTMP:1935 ──────────────▶ ┌──────────────────────────┐
    (bspush.* grey-cloud, direct)      │ haproxy-edge             │ ─ RTMP:1935 ──▶ SRS (VPC)
                                       │ • TLS termination        │
-   BunnyCDN ─ HTTPS:443 pull ───────▶ │ • Cloudflare Origin Cert │ ─ HTTP:8080 ──▶ SRS /live/*.m3u8
+   BunnyCDN ─ HTTPS:443 pull ───────▶ │ • Let's Encrypt SAN cert │ ─ HTTP:8080 ──▶ SRS /live/*.m3u8
    (origin.* grey-cloud, direct)      │ • streaming-auth (Node)  │
                                       │ • Per-IP rate limiting   │
    Backend ─ HTTPS:443 /sign/publish ▶│                          │
@@ -25,9 +25,9 @@ Two-server bootstrap via a single shell script, plus a browser test player with 
                                                                      └──────────────────┘
 ```
 
-- **Ingest**: RTMPS on `:1936` (Let's Encrypt cert when `LETSENCRYPT_EMAIL` is set) or plain RTMP on `:1935` otherwise. Cloudflare cannot proxy RTMP/RTMPS, so ingest DNS must be grey-cloud regardless. HAProxy terminates TLS and forwards plain RTMP to SRS `:1935` over the VPC.
-- **Playback origin pull**: BunnyCDN pulls LL-HLS from `https://origin.example.com` (grey-cloud) on `:443` → SRS `:8080` over VPC. BunnyCDN must have **"Verify origin SSL certificate" off** because the Cloudflare Origin Cert is not publicly trusted.
-- **Publish sign API**: Backend calls `https://api.example.com/sign/publish` (orange-cloud) — Cloudflare terminates public TLS with its Universal SSL cert, then re-encrypts to HAProxy using the Cloudflare Origin Cert.
+- **Ingest**: RTMPS on `:1936` (served the same Let's Encrypt cert) or plain RTMP on `:1935`. Cloudflare cannot proxy RTMP/RTMPS, so ingest DNS must be grey-cloud regardless. HAProxy terminates TLS and forwards plain RTMP to SRS `:1935` over the VPC.
+- **Playback origin pull**: BunnyCDN pulls LL-HLS from `https://origin.example.com` (grey-cloud) on `:443` → SRS `:8080` over VPC. The origin serves a publicly-trusted Let's Encrypt cert, so BunnyCDN's **"Verify origin SSL certificate"** can stay **on**.
+- **Publish sign API**: Backend calls `https://api.example.com/sign/publish` (orange-cloud) — Cloudflare terminates public TLS with its Universal SSL cert, then re-encrypts to HAProxy `:443`. The origin cert is a Let's Encrypt cert for `PLAYBACK_ORIGIN_HOST`/`PUBLISH_HOST` (not `api.*`), so set the Cloudflare SSL mode for `api.*` to **Full** (not Full-strict).
 - **Viewer playback**: BunnyCDN edge serves the HLS manifest + segments to viewers via a **client-signed** URL — each client holds its own `(pull_zone, BUNNY_TOKEN_KEY)` pair and computes the BunnyCDN token locally. No server round-trip per playback session.
 - **Auth**:
   - Publishers: backend calls `POST /sign/publish` (Bearer) → returns `rtmp://.../<studio>?txSecret=<md5>&txTime=<hex>` (and `rtmps://...` when `PUBLISH_RTMPS_ENABLED=true`). SRS `on_publish` hits `streaming-auth /srs/publish` which recomputes `md5(PUBLISH_SIGN_KEY + studio + txTime)` and rejects expired / mismatched signatures.
@@ -131,12 +131,10 @@ Defaults (override with env vars):
 | `HAPROXY_PUBLIC_IP` | `45.76.145.205` |
 | `PUBLISH_HOST` | _(required)_ — OBS ingest hostname, grey-cloud DNS (e.g. `bspush.example.com`) |
 | `PLAYBACK_ORIGIN_HOST` | _(required)_ — BunnyCDN origin hostname, grey-cloud DNS (e.g. `origin.example.com`) |
-| `SSL_CERT_PATH` | `/etc/ssl/cloudflare/origin.pem` — Cloudflare Origin Certificate (for :443) |
-| `SSL_KEY_PATH` | `/etc/ssl/cloudflare/origin.key` — Cloudflare Origin Certificate key |
-| `LETSENCRYPT_EMAIL` | _(optional)_ — if set, script issues a Let's Encrypt cert for `$PUBLISH_HOST` and uses it on :1936 so OBS can publish via RTMPS. Requires public port 80 for HTTP-01 challenge. |
-| `ALLOW_NO_TLS` | `0` — set `1` for dev only |
+| `LETSENCRYPT_EMAIL` | _(required for prod)_ — email for the Let's Encrypt SAN cert covering `$PLAYBACK_ORIGIN_HOST` (:443) + `$PUBLISH_HOST` (:1936). Issued via HTTP-01 — needs public port 80 and both A-records pointed at the box. |
+| `ALLOW_NO_TLS` | `0` — set `1` for dev only (skips Let's Encrypt) |
 
-> Cloudflare does not proxy RTMP/RTMPS (ports 1935/1936). The `PUBLISH_HOST` DNS record **must be grey-cloud** (DNS only). `PLAYBACK_ORIGIN_HOST` should also be grey-cloud so BunnyCDN pulls directly from origin without stacking two CDNs. Use a wildcard Cloudflare Origin Certificate (e.g. `*.example.com`) to cover both hostnames.
+> Cloudflare does not proxy RTMP/RTMPS (ports 1935/1936). The `PUBLISH_HOST` DNS record **must be grey-cloud** (DNS only). `PLAYBACK_ORIGIN_HOST` must also be grey-cloud so BunnyCDN pulls directly from origin without stacking two CDNs. Both A-records point at the HAProxy box; `setup-haproxy.sh` issues one Let's Encrypt SAN cert covering both — no certificate to upload.
 
 ---
 
@@ -155,17 +153,11 @@ $EDITOR .env   # set HAPROXY_VPC_IP, SRS_VPC_IP, PUBLISH_HOST,
                # PLAYBACK_ORIGIN_HOST, LETSENCRYPT_EMAIL, etc.
 ```
 
-Upload the Cloudflare Origin Certificate to the HAProxy box first:
-
-```bash
-ssh root@<haproxy-ip>
-sudo mkdir -p /etc/ssl/cloudflare
-sudo tee /etc/ssl/cloudflare/origin.pem > /dev/null   # paste cert, Ctrl+D
-sudo tee /etc/ssl/cloudflare/origin.key > /dev/null   # paste key,  Ctrl+D
-sudo chmod 644 /etc/ssl/cloudflare/origin.pem
-sudo chmod 600 /etc/ssl/cloudflare/origin.key
-exit
-```
+Point the `PUBLISH_HOST` and `PLAYBACK_ORIGIN_HOST` A-records at the HAProxy
+box (grey-cloud / DNS-only) before deploying — `setup-haproxy.sh` issues the
+Let's Encrypt SAN cert over an HTTP-01 challenge on port 80, so both names
+must resolve to the box and `:80` must be publicly reachable. No certificate
+to upload.
 
 ### 1. stream-auth (NestJS) → HAProxy box
 
@@ -187,16 +179,17 @@ generates `/opt/streaming-auth/.env` (with `SIGN_API_TOKEN_DEFAULT`,
 ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
 ```
 
-This installs HAProxy + certbot, builds `/etc/haproxy/certs/origin.pem` from
-`SSL_CERT_PATH` + `SSL_KEY_PATH`, optionally issues a Let's Encrypt cert for
-`PUBLISH_HOST` on `:1936` (when `LETSENCRYPT_EMAIL` is set), installs the
-BunnyCDN edge IP refresher (`/usr/local/sbin/refresh-bunny-edges.sh` + hourly
-cron), and writes `/etc/haproxy/haproxy.cfg` with TLS, rate limits, CORS, and
-`/sign` → stream-auth + HLS → SRS backend routing.
+This installs HAProxy + certbot, issues one Let's Encrypt SAN cert covering
+`PLAYBACK_ORIGIN_HOST` + `PUBLISH_HOST` (HTTP-01 on `:80`), builds the combined
+PEM at `/etc/haproxy/certs/origin.pem` and binds it on both `:443` (HLS) and
+`:1936` (RTMPS), installs the BunnyCDN edge IP refresher
+(`/usr/local/sbin/refresh-bunny-edges.sh` + hourly cron) and the certbot
+renewal hooks, and writes `/etc/haproxy/haproxy.cfg` with TLS, rate limits,
+CORS, and `/sign` → stream-auth + HLS → SRS backend routing.
 
-> **RTMPS vs RTMP**: OBS validates against public CAs on RTMPS. The Cloudflare
-> Origin Certificate is not publicly trusted, so binding it on :1936 breaks OBS.
-> Set `LETSENCRYPT_EMAIL` in `.env` to fix. Without LE, use plain RTMP `:1935`.
+> **RTMPS**: OBS validates against public CAs on RTMPS. The Let's Encrypt cert
+> covers `PUBLISH_HOST`, so RTMPS on `:1936` works out of the box — no extra
+> step. Plain RTMP on `:1935` remains available.
 
 ### 3. SRS origin → SRS box
 
@@ -233,7 +226,7 @@ opens :3000 from both `$HAPROXY_VPC_IP` (for `/sign/*`) and `$SRS_VPC_IP` (for
 
 **Pull zone basics**
 1. Create pull zone → origin URL: `https://<PLAYBACK_ORIGIN_HOST>`.
-2. Pull Zone → **Origin** → turn **"Verify origin SSL certificate" off** (the Cloudflare Origin Cert is issued by Cloudflare's private CA and not publicly trusted; traffic remains TLS-encrypted regardless).
+2. Pull Zone → **Origin** → **"Verify origin SSL certificate"** can stay **on** — `setup-haproxy.sh` serves a publicly-trusted Let's Encrypt cert for `$PLAYBACK_ORIGIN_HOST`.
 
 **Caching** — let origin Cache-Control headers drive freshness (HAProxy sets them automatically since commit `feat: HAProxy Cache-Control headers`):
 3. Pull Zone → **Caching** → enable **"Respect origin cache control"**.
@@ -279,7 +272,7 @@ The `/sign/publish` endpoint works on any hostname that resolves to the HAProxy 
 |---|---|---|---|
 | `api.example.com` | 🟠 proxied | `HAPROXY_PUBLIC_IP` | Backend → `POST /sign/publish` (public TLS via CF Universal SSL) |
 
-Backend calls `https://api.example.com/sign/publish` — no cert pinning needed, standard public CA chain.
+Backend calls `https://api.example.com/sign/publish` — no cert pinning needed, standard public CA chain. Set the Cloudflare SSL mode for `api.*` to **Full**: the origin `:443` serves the Let's Encrypt cert for `PLAYBACK_ORIGIN_HOST`/`PUBLISH_HOST`, which doesn't carry the `api.*` name, so **Full (strict)** would fail the hostname check.
 
 ---
 
@@ -423,7 +416,7 @@ python3 -m http.server 8000
 
 - OBS is currently publishing to `rtmp://$PUBLISH_HOST/luckylive` with a `<studio>?txSecret=...&txTime=...` key minted by `POST /sign/publish`.
 - BunnyCDN pull zone has Token Authentication enabled and the page can produce a valid signed URL (locally or via a tenant backend).
-- BunnyCDN pull zone is configured with origin `https://$PLAYBACK_ORIGIN_HOST` and **"Verify origin SSL certificate"** disabled.
+- BunnyCDN pull zone is configured with origin `https://$PLAYBACK_ORIGIN_HOST` (origin SSL verification can stay enabled — the cert is publicly trusted).
 
 ---
 
@@ -494,7 +487,7 @@ Env knobs that override YAML:
 - SRS pinned to `v6.0-r0` (not `develop`)
 - UFW additive (never `--force reset`); SRS ports only accept traffic from HAProxy VPC IP
 - Log rotation via journald + logrotate for SRS file log
-- TLS via Cloudflare Origin Certificate (15-year validity; no ACME renewal loop)
+- TLS via a Let's Encrypt SAN cert (`$PLAYBACK_ORIGIN_HOST` + `$PUBLISH_HOST`); certbot renewal hooks auto-rebuild the combined PEM
 
 ---
 
@@ -615,9 +608,9 @@ Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` �
 | `/sign/publish` returns 401 | Missing/wrong `Authorization: Bearer` header |
 | Viewer 403 from CDN with valid-looking token | Token key on the client doesn't match the BunnyCDN pull zone's Authentication Key, or clock drift on the signer (token `expires` is absolute unix ts) |
 | OBS "Failed to connect socket" (25s timeout) | `PUBLISH_HOST` DNS is orange-cloud. CF doesn't proxy 1935/1936 — flip to grey. |
-| OBS "invalid SSL certificate" on RTMPS | OBS rejects the Cloudflare Origin Cert (not publicly trusted). Use plain RTMP on `:1935` or issue a Let's Encrypt cert via DNS-01 for `$PUBLISH_HOST`. |
+| OBS "invalid SSL certificate" on RTMPS | LE cert missing `$PUBLISH_HOST` as a SAN — re-run `setup-haproxy.sh` so certbot reissues with both `-d` names, or fall back to plain RTMP on `:1935`. |
 | Viewer 403 from CDN | Token Auth key mismatch, clock drift, expired URL, **or** the URL was fetched unsigned (Token Authentication is on at the pull zone) |
-| BunnyCDN origin fetch fails with TLS error | Turn off "Verify origin SSL certificate" in the pull zone |
+| BunnyCDN origin fetch fails with TLS error | Confirm the LE cert issued (`certbot certificates` on the box) and that the pull zone origin host matches `$PLAYBACK_ORIGIN_HOST` |
 | SRS systemd exits 255, log says `getifaddrs failed … Address family not supported` | `RestrictAddressFamilies` missing `AF_NETLINK`. Fixed in current script — `daemon-reload` + restart. |
 | SRS publish rejected | `journalctl -u streaming-auth` shows the reason: `missing signature`, `expired`, `bad signature`, `no key`, or `invalid stream`. Re-mint via `/sign/publish` (the URL has a finite `txTime`). |
 | HLS 404 at edge | SRS not generating segments → check `on_publish` hook reached auth service, and OBS is actively publishing |
@@ -631,7 +624,7 @@ ALLOW_NO_TLS=1 ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy
 # (or set ALLOW_NO_TLS=1 in infrastructure/scripts/.env)
 ```
 
-Skips the Cloudflare Origin Cert lookup and binds plain HTTP on `:80` + RTMP on `:1935`. BunnyCDN + `/sign/publish` still work over HTTP.
+Skips Let's Encrypt issuance and binds plain HTTP on `:80` + RTMP on `:1935`. BunnyCDN + `/sign/publish` still work over HTTP.
 
 ---
 
