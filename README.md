@@ -100,6 +100,28 @@ streaming-auth/
 - Domain A record → HAProxy public IP (required for TLS).
 - BunnyCDN pull zone + Token Authentication enabled (configure after haproxy setup).
 
+### VPS sizing
+
+Both boxes are network- and I/O-bound, not CPU-bound — there is no transcoding
+(SRS only remuxes RTMP → LL-HLS), and BunnyCDN absorbs viewer fan-out so the
+origin serves only request-coalesced segment pulls from Bunny edges. Specs are
+largely independent of viewer count; size for ingest concurrency + bandwidth.
+
+| Box | Role | vCPU | RAM | Disk | Network |
+|-----|------|------|-----|------|---------|
+| HAProxy edge (+ stream-auth) | TLS edge, RTMP/RTMPS ingest proxy, `/sign` API | 2 | 2–4 GB | 40 GB NVMe | ≥1 Gbps |
+| SRS origin | RTMP ingest, LL-HLS segmentation | 2–4 | 4–8 GB | 40–80 GB NVMe | ≥1 Gbps |
+
+- **Absolute minimum**: 1 vCPU / 2 GB for the HAProxy box, 2 vCPU / 4 GB for
+  SRS. Leave headroom — SRS compiles from source on first deploy (5–10 min,
+  ~2 GB free RAM needed) and HLS muxing scales with concurrent publishers.
+- **OS**: Ubuntu 22.04 or 24.04 LTS — the setup scripts enforce this.
+- **Disk**: NVMe/SSD strongly recommended on the SRS box — LL-HLS writes 2 s
+  segments continuously, and spinning disks add jitter to segment availability.
+- **Same VPC**: both boxes must share a private network. All inter-box traffic
+  (RTMP, HLS pull, SRS API, publish hooks) rides VPC IPs and is firewalled to
+  them.
+
 Defaults (override with env vars):
 
 | Var | Default |
