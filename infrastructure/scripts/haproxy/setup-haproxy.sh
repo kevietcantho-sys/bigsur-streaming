@@ -399,8 +399,8 @@ backend srs_origin
     # match"). Capture the path in the request phase, match the variable here.
     http-request set-var(txn.req_path) path
     http-response set-header Cache-Control "public, max-age=1" if { var(txn.req_path) -m end .m3u8 }
-    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { var(txn.req_path) -m end .ts }
-    http-response set-header Cache-Control "public, max-age=31536000, immutable" if { var(txn.req_path) -m end .m4s }
+    http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .ts }
+    http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .m4s }
     server origin1 ${SRS_VPC_IP}:8080 check inter 10s rise 2 fall 3 maxconn 1000
 
 backend auth_service
