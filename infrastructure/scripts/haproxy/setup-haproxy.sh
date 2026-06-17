@@ -240,19 +240,31 @@ frontend https_in
     option http-keep-alive
     http-response set-header Strict-Transport-Security \"max-age=31536000; includeSubDomains\"
 
-    # path_beg/path_end are request-phase fetches — used directly in an
-    # http-response rule they silently never match. Capture the path into a
-    # txn variable in the request phase so the http-response rules below work.
-    http-request set-var(txn.req_path) path
-
     acl is_health path /health
     http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
 
+    # Capture path + the allowlisted /sign CORS origin (localhost only) in the
+    # request phase; path_beg/req.hdr never match in the http-response phase.
+    http-request set-var(txn.req_path) path
+    acl is_sign path_beg /sign
+    acl cors_localhost req.hdr(Origin) -m reg -i ^https?://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?$
+    http-request set-var(txn.sign_acao) req.hdr(Origin) if is_sign cors_localhost
+
     acl is_options method OPTIONS
+    # /sign preflight: echo Origin only when it is an allowlisted localhost.
+    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"%[var(txn.sign_acao)]\" hdr \"Vary\" \"Origin\" hdr \"Access-Control-Allow-Methods\" \"POST, OPTIONS\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options is_sign { var(txn.sign_acao) -m found }
+    # /sign preflight from a non-allowlisted origin: 204 without CORS (blocked).
+    http-request return status 204 if is_options is_sign
+    # All other paths (HLS playback): wildcard preflight, unchanged.
     http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"*\" hdr \"Access-Control-Allow-Methods\" \"GET, POST, OPTIONS, HEAD\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Range, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options
 
-    # CORS only for HLS playback paths — /sign is a bearer-authed
-    # backend-to-backend API and needs no cross-origin exposure.
+    # /sign: localhost-only CORS, echo the allowlisted Origin back.
+    http-response set-header Access-Control-Allow-Origin \"%[var(txn.sign_acao)]\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+    http-response set-header Vary \"Origin\" if { var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Methods \"POST, OPTIONS\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+    http-response set-header Access-Control-Allow-Headers \"Content-Type, Authorization\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+
+    # All other paths (HLS playback): wildcard CORS, unchanged.
     http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
     http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
     http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
@@ -316,19 +328,31 @@ frontend http_in
     option httplog
     option http-keep-alive
 
-    # path_beg/path_end are request-phase fetches — used directly in an
-    # http-response rule they silently never match. Capture the path into a
-    # txn variable in the request phase so the http-response rules below work.
-    http-request set-var(txn.req_path) path
-
     acl is_health path /health
     http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
 
+    # Capture path + the allowlisted /sign CORS origin (localhost only) in the
+    # request phase; path_beg/req.hdr never match in the http-response phase.
+    http-request set-var(txn.req_path) path
+    acl is_sign path_beg /sign
+    acl cors_localhost req.hdr(Origin) -m reg -i ^https?://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?$
+    http-request set-var(txn.sign_acao) req.hdr(Origin) if is_sign cors_localhost
+
     acl is_options method OPTIONS
+    # /sign preflight: echo Origin only when it is an allowlisted localhost.
+    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"%[var(txn.sign_acao)]\" hdr \"Vary\" \"Origin\" hdr \"Access-Control-Allow-Methods\" \"POST, OPTIONS\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options is_sign { var(txn.sign_acao) -m found }
+    # /sign preflight from a non-allowlisted origin: 204 without CORS (blocked).
+    http-request return status 204 if is_options is_sign
+    # All other paths (HLS playback): wildcard preflight, unchanged.
     http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"*\" hdr \"Access-Control-Allow-Methods\" \"GET, POST, OPTIONS, HEAD\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Range, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options
 
-    # CORS only for HLS playback paths — /sign is a bearer-authed
-    # backend-to-backend API and needs no cross-origin exposure.
+    # /sign: localhost-only CORS, echo the allowlisted Origin back.
+    http-response set-header Access-Control-Allow-Origin \"%[var(txn.sign_acao)]\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+    http-response set-header Vary \"Origin\" if { var(txn.req_path) -m beg /sign }
+    http-response set-header Access-Control-Allow-Methods \"POST, OPTIONS\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+    http-response set-header Access-Control-Allow-Headers \"Content-Type, Authorization\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
+
+    # All other paths (HLS playback): wildcard CORS, unchanged.
     http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
     http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
     http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
