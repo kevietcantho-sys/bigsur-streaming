@@ -14,6 +14,8 @@
 #   -h            Help
 #
 # Config loaded from ../.env (relative to scripts/). Override per-host via env.
+# SSH user is either root, or a bootstrap'd user with passwordless sudo (see
+# common/bootstrap-remote.sh) — the wrapper prefixes `sudo -E` when not root.
 # =============================================================================
 
 set -euo pipefail
@@ -38,13 +40,14 @@ Usage: $0 [OPTIONS] <host> [host-2] ...
 Loads defaults from ${ENV_FILE}, override below.
 
 Options:
-  -u USER       SSH user (default: \$SSH_USER or 'root')
+  -u USER       SSH user (default: \$SSH_USER or 'root'; e.g. bootstrap'd sudoer)
   -i IDENTITY   SSH identity file
   -h            Help
 
 Examples:
   $0 45.76.145.205
-  $0 -u ubuntu -i ~/.ssh/id_ed25519 45.76.145.205
+  $0 -u deploy 45.76.145.205
+  $0 -u deploy -i ~/.ssh/id_ed25519 45.76.145.205
 EOF
     exit 0
 }

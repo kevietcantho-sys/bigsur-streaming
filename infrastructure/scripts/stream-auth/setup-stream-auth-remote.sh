@@ -12,13 +12,14 @@
 #   ./setup-stream-auth-remote.sh [OPTIONS] <host> [host-2] ...
 #
 # Options:
-#   -u USER          SSH user (override SSH_USER, default: root)
+#   -u USER          SSH user (override SSH_USER, default: root; or bootstrap'd sudoer)
 #   -i IDENTITY      SSH identity file
 #   -h               Help
 #
 # Config loaded from ../.env (relative to scripts/). Override per-host with env
-# vars or flags. SSH user typically root or a sudoer; setup script runs as root
-# (re-execs with sudo if invoking user isn't root).
+# vars or flags. SSH user is either root, or a bootstrap'd user with passwordless
+# sudo (see common/bootstrap-remote.sh) — the wrapper prefixes `sudo -E` to the
+# remote run whenever SSH_USER isn't root.
 # =============================================================================
 
 set -euo pipefail
@@ -46,13 +47,14 @@ Usage: $0 [OPTIONS] <host> [host-2] ...
 Loads defaults from ${ENV_FILE}, override below.
 
 Options:
-  -u USER       SSH user (default: \$SSH_USER or 'root')
+  -u USER       SSH user (default: \$SSH_USER or 'root'; e.g. bootstrap'd sudoer)
   -i IDENTITY   SSH identity file
   -h            Help
 
 Examples:
   $0 45.76.145.205
-  $0 -u ubuntu -i ~/.ssh/id_ed25519 45.76.145.205
+  $0 -u deploy 45.76.145.205
+  $0 -u deploy -i ~/.ssh/id_ed25519 45.76.145.205
 EOF
     exit 0
 }
@@ -173,13 +175,19 @@ for HOST in "$@"; do
     info "Cleaning up ${REMOTE_DIR}..."
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${HOST}" "sudo rm -rf ${REMOTE_DIR}" || true
 
-    # Pull STREAM_KEYS.txt back so the operator can pass SRS_API_PASS to setup-srs-remote.sh
+    # Pull STREAM_KEYS.txt back so the operator can pass SRS_API_PASS to
+    # setup-srs-remote.sh. The setup script writes it into the invoking user's
+    # home (== ${SSH_USER}, since `sudo -E` sets SUDO_USER to the SSH user), so
+    # a relative scp path — which SFTP resolves to ${SSH_USER}'s home — reads it
+    # without sudo for both root (~ = /root) and the bootstrap'd sudo user.
     LOCAL_KEYS="${SCRIPTS_DIR}/.STREAM_KEYS.${HOST}.txt"
-    if scp "${SCP_OPTS[@]}" "${SSH_USER}@${HOST}:/root/STREAM_KEYS.txt" "${LOCAL_KEYS}" 2>/dev/null; then
+    if scp "${SCP_OPTS[@]}" "${SSH_USER}@${HOST}:STREAM_KEYS.txt" "${LOCAL_KEYS}" 2>/dev/null \
+            && [[ -s "${LOCAL_KEYS}" ]]; then
         chmod 600 "${LOCAL_KEYS}"
         info "Saved credentials snapshot at ${LOCAL_KEYS} (chmod 600)"
     else
-        warn "Could not pull /root/STREAM_KEYS.txt (likely SSH user lacks read perm)"
+        rm -f "${LOCAL_KEYS}"
+        warn "Could not pull STREAM_KEYS.txt from ${SSH_USER}@${HOST}'s home"
     fi
 done
 

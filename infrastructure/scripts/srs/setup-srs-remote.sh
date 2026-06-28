@@ -7,8 +7,11 @@
 # Usage:
 #   ./setup-srs-remote.sh [OPTIONS] <host> [host-2] ...
 #
+# SSH user is either root, or a bootstrap'd user with passwordless sudo (see
+# common/bootstrap-remote.sh) — the wrapper prefixes `sudo -E` when not root.
+#
 # Options:
-#   -u USER       SSH user (default: root)
+#   -u USER       SSH user (default: $SSH_USER or root; e.g. the bootstrap'd sudoer)
 #   -i IDENTITY   SSH identity file
 #   -p PASS       SRS_API_PASS (overrides .env / STREAM_KEYS file)
 #   -h            Help
@@ -41,13 +44,14 @@ usage() {
 Usage: $0 [OPTIONS] <host> [host-2] ...
 
 Options:
-  -u USER       SSH user (default: \$SSH_USER or 'root')
+  -u USER       SSH user (default: \$SSH_USER or 'root'; e.g. bootstrap'd sudoer)
   -i IDENTITY   SSH identity file
   -p PASS       SRS_API_PASS override
   -h            Help
 
 Examples:
   $0 10.40.96.4
+  $0 -u deploy 10.40.96.4
   $0 -p s3cret 10.40.96.4
 EOF
     exit 0

@@ -6,12 +6,16 @@ edge: **stream-auth** (NestJS signer), **HAProxy** (TLS edge + Bunny ACL),
 
 Each component has a pair of scripts:
 
-- `setup-<component>.sh`         — runs **on** the target box (as root)
+- `setup-<component>.sh`         — runs **on** the target box as root (directly,
+                                   or via `sudo -E` when deployed by a non-root
+                                   sudo user)
 - `setup-<component>-remote.sh`  — runs **locally**: SSHes in, uploads the
                                    setup script + `common/lib.sh`, executes it,
                                    then cleans up `/tmp`
 
-You normally only invoke the `-remote.sh` wrappers.
+You normally only invoke the `-remote.sh` wrappers. On a brand-new box, run
+`common/bootstrap-remote.sh` once first (creates a non-root sudo user); after
+that, deploy as either `root` or that user.
 
 ## Layout
 
@@ -20,10 +24,12 @@ infrastructure/scripts/
 ├── .env.example                          # copy to .env, edit, source of truth
 ├── README.md                             # this file
 ├── common/
-│   └── lib.sh                            # shared bash helpers (log/require_root/apt_install/...)
+│   ├── lib.sh                            # shared bash helpers (log/require_root/apt_install/...)
+│   ├── bootstrap.sh                      # runs ON a fresh box (as root): creates the non-root sudo user, SSH keys, hardening, UFW
+│   └── bootstrap-remote.sh               # runs LOCALLY: SSHes as root, uploads + executes bootstrap.sh
 ├── stream-auth/
 │   ├── setup-stream-auth.sh              # NestJS build + systemd unit, generates .env on first run
-│   └── setup-stream-auth-remote.sh       # rsyncs streaming-auth/ source, pulls back /root/STREAM_KEYS.txt
+│   └── setup-stream-auth-remote.sh       # rsyncs streaming-auth/ source, pulls back STREAM_KEYS.txt from the SSH user's home
 ├── haproxy/
 │   ├── setup-haproxy.sh                  # haproxy.cfg, TLS, Bunny edge IP refresher (cron)
 │   └── setup-haproxy-remote.sh
@@ -34,8 +40,9 @@ infrastructure/scripts/
 
 ## Prerequisites
 
-- **Target boxes**: Ubuntu 22.04 / 24.04 LTS with passwordless `sudo` (or SSH
-  in as `root` directly).
+- **Target boxes**: Ubuntu 22.04 / 24.04 LTS. Either SSH in as `root` directly,
+  or run `common/bootstrap-remote.sh` first (step 0 below) to create a non-root
+  user with passwordless `sudo`, then deploy as that user with `-u <user>`.
 - **Local machine**: `bash`, `ssh`, `scp`, `rsync`, `openssl`.
 - **HAProxy box**: public port 80 reachable, with the `PUBLISH_HOST` and
   `PLAYBACK_ORIGIN_HOST` A-records pointed at it — `setup-haproxy.sh` issues a
@@ -72,17 +79,47 @@ Optional / advanced:
 | `SRS_API_PASS`         | _(auto)_  | Auto-generated on first stream-auth run; flows to SRS via `STREAM_KEYS.txt` snapshot |
 | `SRS_VERSION`          | `v6.0-r0` | SRS git tag to build |
 
+Bootstrap config (only used by `common/bootstrap-remote.sh`, step 0 — skip if
+you SSH in as root):
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `NEW_USER`             | `deploy`              | Non-root sudo user bootstrap creates; then deploy with `-u $NEW_USER` |
+| `VPC_SUBNET`           | `10.40.96.0/20`       | CIDR that SSH (22/tcp) is allowed from after bootstrap enables UFW |
+| `BASTION_CIDR`         | _(empty)_             | Extra operator/bastion CIDR allowed to SSH (set when bootstrapping over the public internet) |
+| `TIMEZONE`             | `Asia/Ho_Chi_Minh`    | Timezone applied to the box |
+| `TAILSCALE_AUTH_KEY`   | _(empty)_             | Set to install Tailscale and join the tailnet; empty = skip |
+| `TAILSCALE_TAGS`       | _(empty)_             | Tailscale ACL tags, e.g. `tag:service,tag:production` |
+| `SKIP_TAILSCALE`       | `0`                   | `1` skips Tailscale for a node without unsetting the shared key |
+
 ## Deploy
 
 Run in this order (each is idempotent — safe to re-run):
 
 ```bash
+# 0. (optional) Bootstrap a fresh box: create the non-root sudo user.
+#    Skip if you SSH in as root and keep SSH_USER=root.
+./infrastructure/scripts/common/bootstrap-remote.sh <host> [host-2] ...
+# Creates $NEW_USER with passwordless sudo, copies root's SSH keys, hardens
+# SSH (no root login / no password auth), enables UFW allowing SSH only from
+# $VPC_SUBNET (+ $BASTION_CIDR if set). After this, set SSH_USER=$NEW_USER in
+# .env (or pass -u $NEW_USER to each wrapper).
+#
+#   Bootstrapping over the public internet (not from inside the VPC)? Pass your
+#   operator IP or UFW will refuse to enable and lock you out:
+#     ./infrastructure/scripts/common/bootstrap-remote.sh -b <your-ip>/32 <host>
+
+# If you ran step 0, deploy as that sudo user: add `-u $NEW_USER` to each
+# wrapper (or set SSH_USER=$NEW_USER in .env). The wrappers prefix `sudo -E`
+# remotely when the SSH user isn't root.
+
 # 1. stream-auth (NestJS signer)
 ./infrastructure/scripts/stream-auth/setup-stream-auth-remote.sh <stream-auth-ip>
 # On first run: generates SIGN_API_TOKEN_DEFAULT, PUBLISH_SIGN_KEY_DEFAULT,
-# SRS_API_PASS. Writes /root/STREAM_KEYS.txt on the box and pulls a copy back
-# to infrastructure/scripts/.STREAM_KEYS.<host>.txt (chmod 600) for the SRS
-# wrapper to consume.
+# SRS_API_PASS. Writes STREAM_KEYS.txt into the SSH user's home on the box
+# (~/STREAM_KEYS.txt, owned by that user, chmod 600 — /root when SSH'd as root)
+# and pulls a copy back to infrastructure/scripts/.STREAM_KEYS.<host>.txt for
+# the SRS wrapper to consume. No sudo needed for the pull-back.
 
 # 2. HAProxy edge (TLS + Bunny ACL + /sign routing)
 ./infrastructure/scripts/haproxy/setup-haproxy-remote.sh <haproxy-ip>
@@ -122,7 +159,7 @@ All three `-remote.sh` wrappers share:
 
 | Flag      | Meaning |
 |-----------|---------|
-| `-u USER` | SSH user (override `SSH_USER`; default `root`) |
+| `-u USER` | SSH user (override `SSH_USER`; default `root`). Use the bootstrap'd sudo user (`-u $NEW_USER`) when not SSHing as root — the wrapper adds `sudo -E` remotely. Requires passwordless sudo. |
 | `-i FILE` | SSH identity file |
 | `-h`      | Help |
 
@@ -134,14 +171,31 @@ All three `-remote.sh` wrappers share:
 
 Flags must come **before** the host IPs.
 
+`common/bootstrap-remote.sh` always connects as `root` (the box has no other
+user yet) and takes its own flags:
+
+| Flag      | Meaning |
+|-----------|---------|
+| `-u USER` | Non-root sudo user to create (override `NEW_USER`) |
+| `-s CIDR` | VPC subnet SSH is allowed from (override `VPC_SUBNET`) |
+| `-b CIDR` | Extra operator/bastion CIDR allowed to SSH (override `BASTION_CIDR`) |
+| `-z TZ`   | Timezone (override `TIMEZONE`) |
+| `-k KEY`  | Tailscale auth key — enables Tailscale (override `TAILSCALE_AUTH_KEY`) |
+| `-t TAGS` | Tailscale tags (override `TAILSCALE_TAGS`) |
+| `-T`      | Skip Tailscale for this run |
+| `-h`      | Help |
+
 ## What the scripts write on each box
 
 | Box | Path | Purpose |
 |-----|------|---------|
+| all (bootstrap) | `/home/$NEW_USER/.ssh/authorized_keys` | Root's SSH keys copied to the new sudo user |
+| all (bootstrap) | `/etc/sudoers.d/$NEW_USER`                | Passwordless sudo for the new user |
+| all (bootstrap) | `/etc/bigsur/bootstrap.env`               | `NEW_USER` / `VPC_SUBNET` / `BASTION_CIDR` / `TIMEZONE` for later scripts |
 | stream-auth | `/opt/streaming-auth/`                    | App tree (rsynced from `streaming-auth/`) |
 | stream-auth | `/opt/streaming-auth/.env`                | Per-tenant secrets, bind IP, SRS API creds |
 | stream-auth | `/etc/systemd/system/streaming-auth.service` | Hardened systemd unit |
-| stream-auth | `/root/STREAM_KEYS.txt`                   | Credentials snapshot (chmod 600) |
+| stream-auth | `~SSH_USER/STREAM_KEYS.txt`               | Credentials snapshot in the deploy user's home (chmod 600, owned by them; `/root` when run as root) |
 | HAProxy     | `/etc/haproxy/haproxy.cfg`                | Generated config (HTTP/HTTPS/RTMP/RTMPS) |
 | HAProxy     | `/etc/haproxy/certs/origin.pem`           | Let's Encrypt SAN cert — combined fullchain+key, served on `:443` + `:1936` |
 | HAProxy     | `/usr/local/sbin/refresh-bunny-edges.sh`  | Hourly cron — refreshes Bunny edge IP allowlist |
@@ -172,6 +226,9 @@ All scripts are idempotent:
 
 | Symptom | Where to look |
 |---------|---------------|
+| bootstrap `Aborted: SSH source is not allowed` | Your SSH client IP isn't in `VPC_SUBNET`/`BASTION_CIDR`; UFW refused to enable to avoid locking you out. Re-run with `-b <your-ip>/32`. |
+| SSH as `$NEW_USER` fails right after bootstrap | UFW blocked the source IP (not in `VPC_SUBNET`/`BASTION_CIDR`). Fix `.env`/`-b` and re-run; root over the VPC still works. |
+| `Could not pull STREAM_KEYS.txt` | Run as a user whose home holds the file — i.e. the same `-u <user>` used for the stream-auth run (or root). Needs passwordless sudo for the run itself. |
 | `setup-*-remote.sh: SSH failed` | Test `ssh <user>@<host> echo OK` manually; check `-u` / `-i`. |
 | `Missing host` | A flag was placed **after** the IP — flags must come first. |
 | `SRS_API_PASS missing` running setup-srs-remote | Run stream-auth wrapper first, or pass `-p <pass>` explicitly. |

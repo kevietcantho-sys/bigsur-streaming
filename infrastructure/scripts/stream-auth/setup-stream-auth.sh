@@ -76,7 +76,20 @@ require_local_ip "${STREAM_AUTH_VPC_IP}"
 
 APP_DIR=/opt/streaming-auth
 ENV_FILE="${APP_DIR}/.env"
-KEYS_FILE=/root/STREAM_KEYS.txt
+
+# Credentials snapshot lands in the invoking user's home so the operator (and
+# the remote wrapper's pull-back) can read it without sudo. Under `sudo -E`,
+# SUDO_USER is the non-root deploy user; run directly as root, it's unset and
+# we fall back to /root. The file is always chmod 600 and owned by that user.
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    KEYS_OWNER="${SUDO_USER}"
+    KEYS_HOME="$(getent passwd "${SUDO_USER}" | cut -d: -f6)"
+    KEYS_HOME="${KEYS_HOME:-/home/${SUDO_USER}}"
+else
+    KEYS_OWNER="root"
+    KEYS_HOME="/root"
+fi
+KEYS_FILE="${KEYS_HOME}/STREAM_KEYS.txt"
 
 # --- packages ---------------------------------------------------------------
 if ! command -v node >/dev/null 2>&1; then
@@ -226,7 +239,8 @@ cat > "${KEYS_FILE}" <<EOF
 ═══════════════════════════════════════════════════════════════
 EOF
 chmod 600 "${KEYS_FILE}"
-ok "Credentials written to ${KEYS_FILE}"
+chown "${KEYS_OWNER}:" "${KEYS_FILE}"
+ok "Credentials written to ${KEYS_FILE} (owner ${KEYS_OWNER})"
 
 # --- systemd unit -----------------------------------------------------------
 cat > /etc/systemd/system/streaming-auth.service <<'UNIT_EOF'

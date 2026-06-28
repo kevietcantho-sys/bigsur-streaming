@@ -88,6 +88,13 @@ if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
     LE_LIVE="/etc/letsencrypt/live/${PLAYBACK_ORIGIN_HOST}"
     if [[ ! -f "${LE_LIVE}/fullchain.pem" ]]; then
         log "Obtaining Let's Encrypt cert for ${PLAYBACK_ORIGIN_HOST} + ${PUBLISH_HOST} (HTTP-01 on :80)..."
+        # Open :80 BEFORE certbot's standalone server runs. bootstrap.sh leaves
+        # UFW default-deny incoming, so without this the ACME CA's inbound :80
+        # connection is dropped → "Timeout during connect (likely firewall
+        # problem)". Idempotent — the UFW section at the end re-asserts it.
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+            ufw allow 80/tcp comment 'HTTP' >/dev/null 2>&1 || true
+        fi
         systemctl stop haproxy 2>/dev/null || true
         certbot certonly --standalone --non-interactive --agree-tos \
             -m "${LETSENCRYPT_EMAIL}" \
