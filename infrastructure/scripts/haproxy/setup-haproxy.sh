@@ -47,6 +47,11 @@ ALLOW_NO_TLS="${ALLOW_NO_TLS:-0}"
 STREAM_AUTH_VPC_IP="${STREAM_AUTH_VPC_IP:-${HAPROXY_VPC_IP}}"
 STREAM_AUTH_PORT="${STREAM_AUTH_PORT:-3000}"
 BUNNY_EDGE_GUARD="${BUNNY_EDGE_GUARD:-off}"
+# Config-only fast path: regenerate + hitless-reload haproxy.cfg without
+# touching packages, TLS certs, the bunny refresher, sysctl, or UFW. For
+# applying config tweaks (e.g. per-IP conn caps) to an already-provisioned box
+# without dropping live publishers. Set via deploy-haproxy-config-remote.sh.
+CONFIG_ONLY="${HAPROXY_CONFIG_ONLY:-0}"
 
 arg_required "HAPROXY_VPC_IP" "${HAPROXY_VPC_IP}" "HAPROXY_VPC_IP=<ip>"
 arg_required "SRS_VPC_IP"     "${SRS_VPC_IP}"     "SRS_VPC_IP=<ip>"
@@ -68,11 +73,15 @@ require_local_ip "${HAPROXY_VPC_IP}"
 BUNNY_EDGES_LIST=/etc/haproxy/lists/bunny-edges.lst
 BUNNY_EDGES_REFRESHER=/usr/local/sbin/refresh-bunny-edges.sh
 
-# --- packages ---------------------------------------------------------------
-apt_install haproxy certbot ufw curl ca-certificates jq python3
+[[ "${CONFIG_ONLY}" = "1" ]] && log "HAPROXY_CONFIG_ONLY=1 — regenerate + hitless reload of haproxy.cfg only (skipping packages, certs, bunny refresher, sysctl, UFW)"
 
-hostnamectl set-hostname haproxy-edge
-idempotent_append "127.0.1.1 haproxy-edge" /etc/hosts
+# --- packages ---------------------------------------------------------------
+if [[ "${CONFIG_ONLY}" != "1" ]]; then
+    apt_install haproxy certbot ufw curl ca-certificates jq python3
+
+    hostnamectl set-hostname haproxy-edge
+    idempotent_append "127.0.1.1 haproxy-edge" /etc/hosts
+fi
 
 # --- TLS certs (Let's Encrypt — one SAN cert for :443 HLS + :1936 RTMPS) -----
 # CF Origin Certs are only trusted by Cloudflare. PLAYBACK_ORIGIN_HOST is
@@ -80,7 +89,7 @@ idempotent_append "127.0.1.1 haproxy-edge" /etc/hosts
 # a publicly-trusted cert. One LE SAN cert covers the HLS origin host and the
 # OBS ingest host; HAProxy serves it on both :443 and :1936.
 TLS_CERT_PATH=/etc/haproxy/certs/origin.pem
-if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
+if [[ "${ALLOW_NO_TLS}" != "1" && "${CONFIG_ONLY}" != "1" ]]; then
     mkdir -p /etc/haproxy/certs
     chown root:haproxy /etc/haproxy/certs
     chmod 750 /etc/haproxy/certs
@@ -211,11 +220,21 @@ CRON_EOF
         [[ "${seeded}" -lt 30 ]] && die "BUNNY_EDGE_GUARD=enforce but list has only ${seeded} IPs"
     fi
 }
-install_bunny_edge_refresher
+[[ "${CONFIG_ONLY}" != "1" ]] && install_bunny_edge_refresher
 
-# --- HAProxy config ---------------------------------------------------------
-log "Writing /etc/haproxy/haproxy.cfg..."
+# --- HAProxy config (split into /etc/haproxy/conf.d/*.cfg fragments) ---------
+# haproxy.cfg is assembled by concatenating the numbered conf.d fragments in
+# lexical order (00-global first so global+defaults precede every proxy). setup
+# regenerates every fragment from .env; for fast config-only tweaks (no cert /
+# package churn) use deploy-haproxy-config-remote.sh.
+CONF_D=/etc/haproxy/conf.d
+log "Writing ${CONF_D}/*.cfg fragments..."
 [[ ! -f /etc/haproxy/haproxy.cfg.bak ]] && cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak 2>/dev/null || true
+# Snapshot conf.d so a bad regenerate can roll back before touching the live cfg.
+rm -rf "${CONF_D}.bak"
+[[ -d "${CONF_D}" ]] && cp -a "${CONF_D}" "${CONF_D}.bak"
+rm -rf "${CONF_D}"
+mkdir -p "${CONF_D}"
 
 BUNNY_GUARD_DEFS=""
 case "${BUNNY_EDGE_GUARD}" in
@@ -235,12 +254,32 @@ case "${BUNNY_EDGE_GUARD}" in
         ;;
 esac
 
-TLS_FRONTEND_HTTP=""
-TLS_FRONTEND_RTMP=""
-HTTP_FRONTEND=""
+# rtmp_in (:1935) — always present. Per-source-IP concurrency cap (ge 11 → 10
+# concurrent publishes per NAT'd source IP) + connection-rate cap.
+RTMP_IN_FE="frontend rtmp_in
+    bind *:1935
+    mode tcp
+    option tcplog
+    timeout client 24h
+    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
+    tcp-request connection track-sc0 src
+    tcp-request connection reject if { sc0_conn_cur ge 11 }
+    tcp-request connection reject if { sc0_conn_rate ge 20 }
+    default_backend rtmp_origin
+"
+
+FE_HTTP=""
+FE_HTTPS=""
+FE_RTMP=""
 if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
-    TLS_FRONTEND_HTTP="
-frontend https_in
+    FE_HTTP="frontend http_in
+    bind *:80
+    mode http
+    http-request redirect scheme https code 301 unless { path /health }
+    acl is_health path /health
+    http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
+"
+    FE_HTTPS="frontend https_in
     bind *:443 ssl crt /etc/haproxy/certs/origin.pem alpn h2,http/1.1
     mode http
     option httplog
@@ -283,53 +322,21 @@ ${BUNNY_GUARD_DEFS}
     acl is_auth_api path_beg /sign
     use_backend auth_service if is_auth_api
     default_backend srs_origin
-
-frontend rtmps_in
+"
+    FE_RTMP="frontend rtmps_in
     bind *:1936 ssl crt ${TLS_CERT_PATH}
     mode tcp
     option tcplog
     timeout client 24h
     stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
     tcp-request connection track-sc0 src
-    tcp-request connection reject if { sc0_conn_cur ge 5 }
+    tcp-request connection reject if { sc0_conn_cur ge 11 }
     tcp-request connection reject if { sc0_conn_rate ge 20 }
     default_backend rtmp_origin
-"
-    TLS_FRONTEND_RTMP="
-frontend rtmp_in
-    bind *:1935
-    mode tcp
-    option tcplog
-    timeout client 24h
-    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
-    tcp-request connection track-sc0 src
-    tcp-request connection reject if { sc0_conn_cur ge 5 }
-    tcp-request connection reject if { sc0_conn_rate ge 20 }
-    default_backend rtmp_origin
-"
-    HTTP_FRONTEND="
-frontend http_in
-    bind *:80
-    mode http
-    http-request redirect scheme https code 301 unless { path /health }
-    acl is_health path /health
-    http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
-"
+
+${RTMP_IN_FE}"
 else
-    TLS_FRONTEND_RTMP="
-frontend rtmp_in
-    bind *:1935
-    mode tcp
-    option tcplog
-    timeout client 24h
-    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
-    tcp-request connection track-sc0 src
-    tcp-request connection reject if { sc0_conn_cur ge 5 }
-    tcp-request connection reject if { sc0_conn_rate ge 20 }
-    default_backend rtmp_origin
-"
-    HTTP_FRONTEND="
-frontend http_in
+    FE_HTTP="frontend http_in
     bind *:80
     mode http
     option httplog
@@ -372,9 +379,11 @@ ${BUNNY_GUARD_DEFS}
     use_backend auth_service if is_auth_api
     default_backend srs_origin
 "
+    FE_RTMP="${RTMP_IN_FE}"
 fi
 
-cat > /etc/haproxy/haproxy.cfg <<HACFG_EOF
+# --- 00 global + defaults (static) ---
+cat > "${CONF_D}/00-global.cfg" <<'HACFG_EOF'
 global
     log /dev/log local0 info
     log /dev/log local1 notice
@@ -404,20 +413,34 @@ defaults
     timeout http-request 10s
     timeout http-keep-alive 10s
     option redispatch
+HACFG_EOF
 
-${HTTP_FRONTEND}
-${TLS_FRONTEND_HTTP}
-${TLS_FRONTEND_RTMP}
+# --- 10 stats (static, localhost only) ---
+cat > "${CONF_D}/10-stats.cfg" <<'HACFG_EOF'
+listen stats
+    bind 127.0.0.1:8404
+    mode http
+    stats enable
+    stats uri /
+    stats refresh 5s
+    stats admin if LOCALHOST
+HACFG_EOF
 
-#═══════════════════════════════════════════════════════════
-# Backends
-#═══════════════════════════════════════════════════════════
+# --- 20/21/22 frontends (env + mode dependent) ---
+printf '%s\n' "${FE_HTTP}"  > "${CONF_D}/20-frontend-http.cfg"
+[[ -n "${FE_HTTPS}" ]] && printf '%s\n' "${FE_HTTPS}" > "${CONF_D}/21-frontend-https.cfg"
+printf '%s\n' "${FE_RTMP}"  > "${CONF_D}/22-frontend-rtmp.cfg"
+
+# --- 30/31/32 backends (env dependent) ---
+cat > "${CONF_D}/30-backend-rtmp.cfg" <<HACFG_EOF
 backend rtmp_origin
     mode tcp
     option tcp-check
     timeout server 24h
     server origin1 ${SRS_VPC_IP}:1935 check inter 10s rise 2 fall 3
+HACFG_EOF
 
+cat > "${CONF_D}/31-backend-hls.cfg" <<HACFG_EOF
 backend srs_origin
     mode http
     option http-keep-alive
@@ -433,7 +456,9 @@ backend srs_origin
     http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .ts }
     http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .m4s }
     server origin1 ${SRS_VPC_IP}:8080 check inter 10s rise 2 fall 3 maxconn 1000
+HACFG_EOF
 
+cat > "${CONF_D}/32-backend-auth.cfg" <<HACFG_EOF
 backend auth_service
     mode http
     option httpchk GET /health
@@ -442,23 +467,36 @@ backend auth_service
     option forwardfor
     http-reuse safe
     server auth1 ${STREAM_AUTH_VPC_IP}:${STREAM_AUTH_PORT} check inter 5s
-
-listen stats
-    bind 127.0.0.1:8404
-    mode http
-    stats enable
-    stats uri /
-    stats refresh 5s
-    stats admin if LOCALHOST
 HACFG_EOF
 
-haproxy -c -f /etc/haproxy/haproxy.cfg || die "HAProxy config invalid"
-systemctl enable haproxy >/dev/null
-systemctl restart haproxy
-sleep 2
-systemctl is-active --quiet haproxy || die "HAProxy failed; journalctl -u haproxy"
-ok "HAProxy running"
+# --- assemble haproxy.cfg from fragments (00-global first) -------------------
+cat "${CONF_D}"/*.cfg > /etc/haproxy/haproxy.cfg
 
+if ! haproxy -c -f /etc/haproxy/haproxy.cfg; then
+    warn "HAProxy config invalid — rolling back conf.d"
+    if [[ -d "${CONF_D}.bak" ]]; then
+        rm -rf "${CONF_D}"; mv "${CONF_D}.bak" "${CONF_D}"
+        cat "${CONF_D}"/*.cfg > /etc/haproxy/haproxy.cfg 2>/dev/null || true
+    fi
+    die "HAProxy config invalid"
+fi
+rm -rf "${CONF_D}.bak"
+ok "haproxy.cfg assembled from $(ls -1 "${CONF_D}"/*.cfg | wc -l | tr -d ' ') conf.d fragments"
+if [[ "${CONFIG_ONLY}" = "1" ]]; then
+    # Hitless reload — keeps live RTMP/RTMPS publishers connected.
+    systemctl reload haproxy
+    sleep 1
+    systemctl is-active --quiet haproxy || die "HAProxy failed; journalctl -u haproxy"
+    ok "HAProxy config reloaded (hitless)"
+else
+    systemctl enable haproxy >/dev/null
+    systemctl restart haproxy
+    sleep 2
+    systemctl is-active --quiet haproxy || die "HAProxy failed; journalctl -u haproxy"
+    ok "HAProxy running"
+fi
+
+if [[ "${CONFIG_ONLY}" != "1" ]]; then
 # --- kernel tuning ----------------------------------------------------------
 cat > /etc/sysctl.d/99-streaming.conf <<'SYSCTL_EOF'
 net.core.somaxconn = 65535
@@ -486,6 +524,7 @@ if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
     ufw allow 1936/tcp comment 'RTMPS' >/dev/null
 fi
 ok "UFW rules applied"
+fi
 
 # --- verify -----------------------------------------------------------------
 log "Verifying..."
