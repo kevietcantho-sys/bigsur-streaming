@@ -178,10 +178,13 @@ vhost __defaultVhost__ {
         hls_fragment        2;
         hls_window          20;
         hls_cleanup         on;
-        # Delete .m3u8 + segments 5s after on_unpublish. Combined with
-        # publish.normal_timeout above, total cleanup window after a dead
-        # publisher is ~15s.
-        hls_dispose         5;
+        # DISABLED (0): SRS 6.0.184 does not cancel the dispose timer armed by
+        # an unpublish when the same stream name re-publishes within/after the
+        # window — the timer later "gracefully disposes" the LIVE muxer, after
+        # which the stream keeps ingesting but writes no HLS (playback 404s
+        # until the next re-publish). Observed in prod 2026-07-05. Stale files
+        # from ended streams are reaped by /etc/cron.d/srs-hls-cleanup instead.
+        hls_dispose         0;
         hls_wait_keyframe   on;
         hls_ctx             off;
         hls_ts_ctx          off;
@@ -207,6 +210,18 @@ net.ipv4.tcp_keepalive_probes = 3
 SYSCTL_EOF
 sysctl -p /etc/sysctl.d/99-srs.conf >/dev/null
 ok "TCP keepalive tuned"
+
+# --- stale HLS cleanup (replaces hls_dispose, see hls config above) ----------
+# Live playlists/segments are rewritten every ~2s, so anything untouched for
+# 60 min belongs to an ended stream. Scoped to HLS file types only — SRS ships
+# players/index.html in the same htdocs dir.
+cat > /etc/cron.d/srs-hls-cleanup <<'CRON_EOF'
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/10 * * * *  srs  find /opt/srs/trunk/objs/nginx/html -type f \( -name '*.ts' -o -name '*.ts.tmp' -o -name '*.m3u8' \) -mmin +60 -delete
+CRON_EOF
+chmod 0644 /etc/cron.d/srs-hls-cleanup
+ok "Stale-HLS cleanup cron installed (/etc/cron.d/srs-hls-cleanup)"
 
 # tmpfiles for /var/run/srs
 cat > /etc/tmpfiles.d/srs.conf <<'TMPF_EOF'

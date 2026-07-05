@@ -23,6 +23,9 @@ logs/
 # Credential snapshots pulled back by infrastructure deploy wrappers
 .STREAM_KEYS.*
 
+# Local debug/ops scripts (load prod credentials from .env at runtime)
+_debug/
+
 # Node (belt-and-suspenders; streaming-auth/.gitignore also covers these)
 node_modules/
 dist/
