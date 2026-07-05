@@ -212,13 +212,16 @@ sysctl -p /etc/sysctl.d/99-srs.conf >/dev/null
 ok "TCP keepalive tuned"
 
 # --- stale HLS cleanup (replaces hls_dispose, see hls config above) ----------
-# Live playlists/segments are rewritten every ~2s, so anything untouched for
-# 60 min belongs to an ended stream. Scoped to HLS file types only — SRS ships
+# A live playlist is rewritten every ~2s and publish.normal_timeout (10s)
+# unpublishes stalled sessions, so any HLS file untouched for 2 min belongs to
+# an ended stream — without this, players keep getting the last (ENDLIST-less)
+# playlist as a frozen "live" stream. Every-minute cron → playback 404s within
+# ~3 min of stream stop. Scoped to HLS file types only — SRS ships
 # players/index.html in the same htdocs dir.
 cat > /etc/cron.d/srs-hls-cleanup <<'CRON_EOF'
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/10 * * * *  srs  find /opt/srs/trunk/objs/nginx/html -type f \( -name '*.ts' -o -name '*.ts.tmp' -o -name '*.m3u8' \) -mmin +60 -delete
+* * * * *  srs  find /opt/srs/trunk/objs/nginx/html -type f \( -name '*.ts' -o -name '*.ts.tmp' -o -name '*.m3u8' \) -mmin +2 -delete
 CRON_EOF
 chmod 0644 /etc/cron.d/srs-hls-cleanup
 ok "Stale-HLS cleanup cron installed (/etc/cron.d/srs-hls-cleanup)"
