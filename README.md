@@ -185,10 +185,11 @@ This installs HAProxy + certbot, issues one Let's Encrypt SAN cert covering
 PEM at `/etc/haproxy/certs/origin.pem` and binds it on both `:443` (HLS) and
 `:1936` (RTMPS), installs the BunnyCDN edge IP refresher
 (`/usr/local/sbin/refresh-bunny-edges.sh` + hourly cron) and the certbot
-renewal hooks, and writes the HAProxy config as numbered fragments under
+renewal hooks, and renders the HAProxy config as numbered fragments under
 `/etc/haproxy/conf.d/*.cfg` (TLS, per-IP rate/conn limits, CORS, and `/sign` →
-stream-auth + HLS → SRS backend routing), assembling `/etc/haproxy/haproxy.cfg`
-by concatenating them in lexical order.
+stream-auth + HLS → SRS backend routing) from the
+`infrastructure/scripts/haproxy/conf/*.cfg` templates, assembling
+`/etc/haproxy/haproxy.cfg` by concatenating them in lexical order.
 
 > **Config-only changes**: for routing / rate-limit tweaks on an
 > already-provisioned edge, skip the full re-run and use
@@ -611,13 +612,16 @@ systemctl restart srs                       # on origin
 ./infrastructure/scripts/haproxy/deploy-haproxy-config-remote.sh <haproxy-ip>
 ```
 
-> **HAProxy config layout**: `setup-haproxy.sh` writes numbered fragments to
-> `/etc/haproxy/conf.d/*.cfg` (`00-global`, `10-stats`, `20/21/22-frontend-*`,
-> `30/31/32-backend-*`) and assembles `/etc/haproxy/haproxy.cfg` by
-> concatenating them in lexical order. Regeneration snapshots `conf.d/` and
-> rolls back automatically if `haproxy -c` rejects the assembled config. The
-> per-source-IP ingest cap lives in `22-frontend-rtmp.cfg`
-> (`tcp-request connection reject if { sc0_conn_cur ge 11 }` → 10 concurrent
+> **HAProxy config layout**: the fragment sources live in the repo at
+> `infrastructure/scripts/haproxy/conf/*.cfg` (with `@TOKEN@` placeholders
+> substituted from `.env`). `setup-haproxy.sh` renders them as numbered
+> fragments to `/etc/haproxy/conf.d/*.cfg` (`00-global`, `10-stats`,
+> `20/21/22/23-frontend-*`, `30/31/32-backend-*`) and assembles
+> `/etc/haproxy/haproxy.cfg` by concatenating them in lexical order.
+> Regeneration snapshots `conf.d/` and rolls back automatically if `haproxy -c`
+> rejects the assembled config. The per-source-IP ingest cap lives in
+> `22-frontend-rtmp.cfg` / `23-frontend-rtmps.cfg`
+> (`tcp-request connection reject if { sc0_conn_cur ge 21 }` → 20 concurrent
 > publishes per NAT'd source IP).
 
 Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` → `systemctl restart streaming-auth`. Rotating `PUBLISH_SIGN_KEY` invalidates every live OBS URL — publishers must re-fetch from `/sign/publish`.
@@ -632,7 +636,7 @@ Rotate `SIGN_API_TOKEN` or `PUBLISH_SIGN_KEY`: edit `/opt/streaming-auth/.env` �
 | `/sign/publish` returns 401 | Missing/wrong `Authorization: Bearer` header |
 | Viewer 403 from CDN with valid-looking token | Token key on the client doesn't match the BunnyCDN pull zone's Authentication Key, or clock drift on the signer (token `expires` is absolute unix ts) |
 | OBS "Failed to connect socket" (25s timeout) | `PUBLISH_HOST` DNS is orange-cloud. CF doesn't proxy 1935/1936 — flip to grey. |
-| Nth OBS publish from one studio/network rejected at connect (others fine) | Per-source-IP concurrency cap in `22-frontend-rtmp.cfg` — all publishers behind one NAT share `sc0_conn_cur` (`ge 11` → 10 concurrent). Confirm: `echo "show table rtmp_in" \| socat stdio /run/haproxy/admin.sock` (and `rtmps_in`). Raise the `ge` value + `deploy-haproxy-config-remote.sh`. Stale/half-open connections (`timeout client 24h`) can also occupy slots. |
+| Nth OBS publish from one studio/network rejected at connect (others fine) | Per-source-IP concurrency cap in `22-frontend-rtmp.cfg` / `23-frontend-rtmps.cfg` — all publishers behind one NAT share `sc0_conn_cur` (`ge 21` → 20 concurrent). Confirm: `echo "show table rtmp_in" \| socat stdio /run/haproxy/admin.sock` (and `rtmps_in`). Raise the `ge` value in the repo's `conf/` templates + `deploy-haproxy-config-remote.sh`. Ghost connections from abruptly-killed publishers are reaped by client TCP keepalive (~1 min) and the RTMP backend's `timeout tunnel 10m`; kill one immediately with `echo "shutdown session <id>" \| socat stdio /run/haproxy/admin.sock` (ids from `show sess`). |
 | OBS "invalid SSL certificate" on RTMPS | LE cert missing `$PUBLISH_HOST` as a SAN — re-run `setup-haproxy.sh` so certbot reissues with both `-d` names, or fall back to plain RTMP on `:1935`. |
 | Viewer 403 from CDN | Token Auth key mismatch, clock drift, expired URL, **or** the URL was fetched unsigned (Token Authentication is on at the pull zone) |
 | BunnyCDN origin fetch fails with TLS error | Confirm the LE cert issued (`certbot certificates` on the box) and that the pull zone origin host matches `$PLAYBACK_ORIGIN_HOST` |

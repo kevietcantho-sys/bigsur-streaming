@@ -222,13 +222,17 @@ CRON_EOF
 }
 [[ "${CONFIG_ONLY}" != "1" ]] && install_bunny_edge_refresher
 
-# --- HAProxy config (split into /etc/haproxy/conf.d/*.cfg fragments) ---------
+# --- HAProxy config (rendered from conf/ templates → /etc/haproxy/conf.d) ----
 # haproxy.cfg is assembled by concatenating the numbered conf.d fragments in
-# lexical order (00-global first so global+defaults precede every proxy). setup
-# regenerates every fragment from .env; for fast config-only tweaks (no cert /
-# package churn) use deploy-haproxy-config-remote.sh.
+# lexical order (00-global first so global+defaults precede every proxy). The
+# fragment sources are the conf/*.cfg templates next to this script; @TOKEN@
+# placeholders are substituted from .env at render time. For fast config-only
+# tweaks (no cert / package churn) use deploy-haproxy-config-remote.sh.
 CONF_D=/etc/haproxy/conf.d
-log "Writing ${CONF_D}/*.cfg fragments..."
+CONF_SRC="${SCRIPT_DIR}/conf"
+[[ -d "${CONF_SRC}" ]] || die "conf/ templates missing at ${CONF_SRC}"
+
+log "Rendering ${CONF_SRC}/*.cfg → ${CONF_D}/*.cfg..."
 [[ ! -f /etc/haproxy/haproxy.cfg.bak ]] && cp /etc/haproxy/haproxy.cfg /etc/haproxy/haproxy.cfg.bak 2>/dev/null || true
 # Snapshot conf.d so a bad regenerate can roll back before touching the live cfg.
 rm -rf "${CONF_D}.bak"
@@ -239,235 +243,41 @@ mkdir -p "${CONF_D}"
 BUNNY_GUARD_DEFS=""
 case "${BUNNY_EDGE_GUARD}" in
     monitor)
-        BUNNY_GUARD_DEFS="
-    # BunnyCDN edge allowlist (monitor — log only).
+        BUNNY_GUARD_DEFS="    # BunnyCDN edge allowlist (monitor — log only).
     acl is_bunny_edge src -f ${BUNNY_EDGES_LIST}
-    http-request set-log-level alert if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge
-"
+    http-request set-log-level alert if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge"
         ;;
     enforce)
-        BUNNY_GUARD_DEFS="
-    # BunnyCDN edge allowlist (enforce — 403 non-Bunny IPs).
+        BUNNY_GUARD_DEFS="    # BunnyCDN edge allowlist (enforce — 403 non-Bunny IPs).
     acl is_bunny_edge src -f ${BUNNY_EDGES_LIST}
-    http-request deny deny_status 403 if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge
-"
+    http-request deny deny_status 403 if !{ path /health } !{ path_beg /sign } !{ method OPTIONS } !is_bunny_edge"
         ;;
 esac
 
-# rtmp_in (:1935) — always present. Per-source-IP concurrency cap (ge 11 → 10
-# concurrent publishes per NAT'd source IP) + connection-rate cap.
-RTMP_IN_FE="frontend rtmp_in
-    bind *:1935
-    mode tcp
-    option tcplog
-    timeout client 24h
-    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
-    tcp-request connection track-sc0 src
-    tcp-request connection reject if { sc0_conn_cur ge 11 }
-    tcp-request connection reject if { sc0_conn_rate ge 20 }
-    default_backend rtmp_origin
-"
+render() { # render <template> <dest-fragment> — substitute @TOKEN@ placeholders
+    local content
+    content="$(cat "${CONF_SRC}/$1")"
+    content="${content//@TLS_CERT_PATH@/${TLS_CERT_PATH}}"
+    content="${content//@SRS_VPC_IP@/${SRS_VPC_IP}}"
+    content="${content//@STREAM_AUTH_VPC_IP@/${STREAM_AUTH_VPC_IP}}"
+    content="${content//@STREAM_AUTH_PORT@/${STREAM_AUTH_PORT}}"
+    content="${content//@BUNNY_GUARD_DEFS@/${BUNNY_GUARD_DEFS}}"
+    printf '%s\n' "${content}" > "${CONF_D}/$2"
+}
 
-FE_HTTP=""
-FE_HTTPS=""
-FE_RTMP=""
+render 00-global.cfg 00-global.cfg
+render 10-stats.cfg  10-stats.cfg
 if [[ "${ALLOW_NO_TLS}" != "1" ]]; then
-    FE_HTTP="frontend http_in
-    bind *:80
-    mode http
-    http-request redirect scheme https code 301 unless { path /health }
-    acl is_health path /health
-    http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
-"
-    FE_HTTPS="frontend https_in
-    bind *:443 ssl crt /etc/haproxy/certs/origin.pem alpn h2,http/1.1
-    mode http
-    option httplog
-    option http-keep-alive
-    http-response set-header Strict-Transport-Security \"max-age=31536000; includeSubDomains\"
-
-    acl is_health path /health
-    http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
-
-    # Capture path + the allowlisted /sign CORS origin (localhost only) in the
-    # request phase; path_beg/req.hdr never match in the http-response phase.
-    http-request set-var(txn.req_path) path
-    acl is_sign path_beg /sign
-    acl cors_localhost req.hdr(Origin) -m reg -i ^https?://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?$
-    http-request set-var(txn.sign_acao) req.hdr(Origin) if is_sign cors_localhost
-
-    acl is_options method OPTIONS
-    # /sign preflight: echo Origin only when it is an allowlisted localhost.
-    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"%[var(txn.sign_acao)]\" hdr \"Vary\" \"Origin\" hdr \"Access-Control-Allow-Methods\" \"POST, OPTIONS\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options is_sign { var(txn.sign_acao) -m found }
-    # /sign preflight from a non-allowlisted origin: 204 without CORS (blocked).
-    http-request return status 204 if is_options is_sign
-    # All other paths (HLS playback): wildcard preflight, unchanged.
-    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"*\" hdr \"Access-Control-Allow-Methods\" \"GET, POST, OPTIONS, HEAD\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Range, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options
-
-    # /sign: localhost-only CORS, echo the allowlisted Origin back.
-    http-response set-header Access-Control-Allow-Origin \"%[var(txn.sign_acao)]\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-    http-response set-header Vary \"Origin\" if { var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"POST, OPTIONS\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Authorization\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-
-    # All other paths (HLS playback): wildcard CORS, unchanged.
-    http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
-
-    stick-table type ip size 100k expire 60s store http_req_rate(10s)
-    http-request track-sc0 src if { path_beg /sign }
-    http-request deny deny_status 429 if { path_beg /sign } { sc0_http_req_rate gt 60 }
-${BUNNY_GUARD_DEFS}
-    acl is_auth_api path_beg /sign
-    use_backend auth_service if is_auth_api
-    default_backend srs_origin
-"
-    FE_RTMP="frontend rtmps_in
-    bind *:1936 ssl crt ${TLS_CERT_PATH}
-    mode tcp
-    option tcplog
-    timeout client 24h
-    stick-table type ip size 100k expire 60s store conn_cur,conn_rate(30s)
-    tcp-request connection track-sc0 src
-    tcp-request connection reject if { sc0_conn_cur ge 11 }
-    tcp-request connection reject if { sc0_conn_rate ge 20 }
-    default_backend rtmp_origin
-
-${RTMP_IN_FE}"
+    render 20-frontend-http.cfg   20-frontend-http.cfg
+    render 21-frontend-https.cfg  21-frontend-https.cfg
+    render 23-frontend-rtmps.cfg  23-frontend-rtmps.cfg
 else
-    FE_HTTP="frontend http_in
-    bind *:80
-    mode http
-    option httplog
-    option http-keep-alive
-
-    acl is_health path /health
-    http-request return status 200 content-type text/plain string \"ok\\n\" if is_health
-
-    # Capture path + the allowlisted /sign CORS origin (localhost only) in the
-    # request phase; path_beg/req.hdr never match in the http-response phase.
-    http-request set-var(txn.req_path) path
-    acl is_sign path_beg /sign
-    acl cors_localhost req.hdr(Origin) -m reg -i ^https?://(localhost|127\.0\.0\.1)(:[0-9]{1,5})?$
-    http-request set-var(txn.sign_acao) req.hdr(Origin) if is_sign cors_localhost
-
-    acl is_options method OPTIONS
-    # /sign preflight: echo Origin only when it is an allowlisted localhost.
-    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"%[var(txn.sign_acao)]\" hdr \"Vary\" \"Origin\" hdr \"Access-Control-Allow-Methods\" \"POST, OPTIONS\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options is_sign { var(txn.sign_acao) -m found }
-    # /sign preflight from a non-allowlisted origin: 204 without CORS (blocked).
-    http-request return status 204 if is_options is_sign
-    # All other paths (HLS playback): wildcard preflight, unchanged.
-    http-request return status 204 hdr \"Access-Control-Allow-Origin\" \"*\" hdr \"Access-Control-Allow-Methods\" \"GET, POST, OPTIONS, HEAD\" hdr \"Access-Control-Allow-Headers\" \"Content-Type, Range, Authorization\" hdr \"Access-Control-Max-Age\" \"86400\" if is_options
-
-    # /sign: localhost-only CORS, echo the allowlisted Origin back.
-    http-response set-header Access-Control-Allow-Origin \"%[var(txn.sign_acao)]\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-    http-response set-header Vary \"Origin\" if { var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"POST, OPTIONS\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Authorization\" if { var(txn.req_path) -m beg /sign } { var(txn.sign_acao) -m found }
-
-    # All other paths (HLS playback): wildcard CORS, unchanged.
-    http-response set-header Access-Control-Allow-Origin \"*\" if !{ var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Methods \"GET, POST, OPTIONS, HEAD\" if !{ var(txn.req_path) -m beg /sign }
-    http-response set-header Access-Control-Allow-Headers \"Content-Type, Range, Authorization\" if !{ var(txn.req_path) -m beg /sign }
-
-    stick-table type ip size 100k expire 60s store http_req_rate(10s)
-    http-request track-sc0 src if { path_beg /sign }
-    http-request deny deny_status 429 if { path_beg /sign } { sc0_http_req_rate gt 60 }
-${BUNNY_GUARD_DEFS}
-    acl is_auth_api path_beg /sign
-    use_backend auth_service if is_auth_api
-    default_backend srs_origin
-"
-    FE_RTMP="${RTMP_IN_FE}"
+    render 20-frontend-http-notls.cfg 20-frontend-http.cfg
 fi
-
-# --- 00 global + defaults (static) ---
-cat > "${CONF_D}/00-global.cfg" <<'HACFG_EOF'
-global
-    log /dev/log local0 info
-    log /dev/log local1 notice
-    chroot /var/lib/haproxy
-    stats socket /run/haproxy/admin.sock mode 660 level admin
-    stats timeout 30s
-    user haproxy
-    group haproxy
-    daemon
-    maxconn 40000
-    nbthread 4
-    tune.bufsize 32768
-    tune.maxrewrite 8192
-    tune.ssl.default-dh-param 2048
-    ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305
-    ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
-
-defaults
-    log global
-    option dontlognull
-    retries 3
-    maxconn 40000
-    timeout connect 5s
-    timeout client  60s
-    timeout server  60s
-    timeout tunnel  24h
-    timeout http-request 10s
-    timeout http-keep-alive 10s
-    option redispatch
-HACFG_EOF
-
-# --- 10 stats (static, localhost only) ---
-cat > "${CONF_D}/10-stats.cfg" <<'HACFG_EOF'
-listen stats
-    bind 127.0.0.1:8404
-    mode http
-    stats enable
-    stats uri /
-    stats refresh 5s
-    stats admin if LOCALHOST
-HACFG_EOF
-
-# --- 20/21/22 frontends (env + mode dependent) ---
-printf '%s\n' "${FE_HTTP}"  > "${CONF_D}/20-frontend-http.cfg"
-[[ -n "${FE_HTTPS}" ]] && printf '%s\n' "${FE_HTTPS}" > "${CONF_D}/21-frontend-https.cfg"
-printf '%s\n' "${FE_RTMP}"  > "${CONF_D}/22-frontend-rtmp.cfg"
-
-# --- 30/31/32 backends (env dependent) ---
-cat > "${CONF_D}/30-backend-rtmp.cfg" <<HACFG_EOF
-backend rtmp_origin
-    mode tcp
-    option tcp-check
-    timeout server 24h
-    server origin1 ${SRS_VPC_IP}:1935 check inter 10s rise 2 fall 3
-HACFG_EOF
-
-cat > "${CONF_D}/31-backend-hls.cfg" <<HACFG_EOF
-backend srs_origin
-    mode http
-    option http-keep-alive
-    option forwardfor
-    http-reuse safe
-    timeout connect 3s
-    timeout server 30s
-    # path_end is a request-phase fetch — used directly in http-response it
-    # silently never matches (HAProxy 2.8 warns: "anonymous acl will never
-    # match"). Capture the path in the request phase, match the variable here.
-    http-request set-var(txn.req_path) path
-    http-response set-header Cache-Control "public, max-age=1" if { var(txn.req_path) -m end .m3u8 }
-    http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .ts }
-    http-response set-header Cache-Control "public, max-age=60" if { var(txn.req_path) -m end .m4s }
-    server origin1 ${SRS_VPC_IP}:8080 check inter 10s rise 2 fall 3 maxconn 1000
-HACFG_EOF
-
-cat > "${CONF_D}/32-backend-auth.cfg" <<HACFG_EOF
-backend auth_service
-    mode http
-    option httpchk GET /health
-    http-check expect status 200
-    option http-keep-alive
-    option forwardfor
-    http-reuse safe
-    server auth1 ${STREAM_AUTH_VPC_IP}:${STREAM_AUTH_PORT} check inter 5s
-HACFG_EOF
+render 22-frontend-rtmp.cfg 22-frontend-rtmp.cfg
+render 30-backend-rtmp.cfg  30-backend-rtmp.cfg
+render 31-backend-hls.cfg   31-backend-hls.cfg
+render 32-backend-auth.cfg  32-backend-auth.cfg
 
 # --- assemble haproxy.cfg from fragments (00-global first) -------------------
 cat "${CONF_D}"/*.cfg > /etc/haproxy/haproxy.cfg

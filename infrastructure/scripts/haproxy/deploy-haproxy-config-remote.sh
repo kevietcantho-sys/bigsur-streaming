@@ -4,8 +4,9 @@
 # =============================================================================
 #
 # Thin wrapper over setup-haproxy-remote.sh that sets HAPROXY_CONFIG_ONLY=1.
-# On the target box, setup-haproxy.sh then regenerates /etc/haproxy/haproxy.cfg
-# from the current .env, validates it (`haproxy -c`), and does a HITLESS
+# On the target box, setup-haproxy.sh then re-renders /etc/haproxy/conf.d/*.cfg
+# from the conf/ templates + current .env, assembles and validates
+# /etc/haproxy/haproxy.cfg (`haproxy -c`), and does a HITLESS
 # `systemctl reload` — WITHOUT touching packages, TLS certs, the bunny edge
 # refresher, sysctl, or UFW, and WITHOUT dropping live RTMP/RTMPS publishers.
 #

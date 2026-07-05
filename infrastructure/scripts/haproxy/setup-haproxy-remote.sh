@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Remote wrapper — runs setup-haproxy.sh on a target box.
-# Uploads setup-haproxy.sh + common/lib.sh, then executes remotely.
+# Uploads setup-haproxy.sh + conf/ templates + common/lib.sh, then executes
+# remotely.
 # Does NOT deploy stream-auth (use setup-stream-auth-remote.sh first).
 # =============================================================================
 #
@@ -23,6 +24,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SETUP_SCRIPT="${SCRIPT_DIR}/setup-haproxy.sh"
+CONF_DIR="${SCRIPT_DIR}/conf"
 LIB_FILE="${SCRIPTS_DIR}/common/lib.sh"
 ENV_FILE="${SCRIPTS_DIR}/.env"
 ENV_EXAMPLE="${SCRIPTS_DIR}/.env.example"
@@ -79,6 +81,7 @@ done
 
 [[ $# -lt 1 ]] && fail "Missing host."
 [[ ! -f "${SETUP_SCRIPT}" ]] && fail "setup-haproxy.sh missing at ${SETUP_SCRIPT}"
+[[ ! -d "${CONF_DIR}" ]]     && fail "conf/ templates missing at ${CONF_DIR}"
 [[ ! -f "${LIB_FILE}" ]]     && fail "common/lib.sh missing at ${LIB_FILE}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
@@ -127,8 +130,9 @@ for HOST in "$@"; do
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${HOST}" \
         "sudo rm -rf ${REMOTE_DIR} && sudo mkdir -p ${REMOTE_DIR} && sudo chown ${SSH_USER}: ${REMOTE_DIR}"
 
-    info "Uploading setup script + lib.sh..."
+    info "Uploading setup script + conf/ templates + lib.sh..."
     scp "${SCP_OPTS[@]}" "${SETUP_SCRIPT}" "${SSH_USER}@${HOST}:${REMOTE_DIR}/setup-haproxy.sh"
+    scp -r "${SCP_OPTS[@]}" "${CONF_DIR}"  "${SSH_USER}@${HOST}:${REMOTE_DIR}/conf"
     scp "${SCP_OPTS[@]}" "${LIB_FILE}"     "${SSH_USER}@${HOST}:${REMOTE_DIR}/lib.sh"
     log "Upload done"
 
